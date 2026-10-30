@@ -2,6 +2,7 @@ name: 00_treeui_base
 
 # Base stock: compila el kernel de TreeUI SIN modificaciones y genera una
 # auditoria de bateria (dts + driver + .config) para revisar la calibracion.
+# Regla fija: este arbol de Samsung se compila SIN O=out.
 
 on:
   workflow_dispatch:
@@ -27,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zip \
-            gcc-9 g++-9 device-tree-compiler
+            gcc-9 g++-9 device-tree-compiler binutils
 
       - name: Clonar kernel TreeUI (sin historial)
         run: |
@@ -101,32 +102,40 @@ jobs:
           SHA=$(git -C kernel rev-parse --short HEAD)
 
           # Base stock: sin overclock (cpu_max_c1), sin parches de ramdisk de Lineage.
-          # Se conservan BLOCK y device names de tu anykernel.sh.
+          # BLOCK: se busca entre varias rutas conocidas (verificada en el ROM:
+          # /dev/block/by-name/BOOT -> mmcblk0p11). No se usa mmcblk0p11 crudo a proposito.
+          # devicecheck=0: PIF spoofea ro.product.device en el ROM (x1s / SM-G980F) y en
+          # recovery no se conoce el estado; se desactiva para no abortar en falso.
           cat > ak3/anykernel.sh <<'EOF'
           #!/sbin/sh
           ## AnyKernel3 setup script - TreeUI base stock (a7y18lte)
 
           properties() { '
           kernel.string=TreeUI base stock __VER__ (a7y18lte) - sin modificaciones
-          do.devicecheck=1
+          do.devicecheck=0
           do.modules=0
           do.systemless=0
           do.cleanup=1
           do.cleanuponabort=0
-          device.name1=a7y18lte
-          device.name2=SM-A750F
-          device.name3=SM-A750FN
-          device.name4=SM-A750G
-          device.name5=
           supported.versions=
           supported.patchlevels=
           '; }
 
-          BLOCK=/dev/block/platform/13500000.dwmmc0/by-name/BOOT;
+          BLOCK=;
+          for p in /dev/block/by-name/BOOT \
+                   /dev/block/platform/13500000.dwmmc0/by-name/BOOT \
+                   /dev/block/bootdevice/by-name/BOOT; do
+            if [ -e "$p" ]; then BLOCK=$p; break; fi
+          done
           is_slot_device=0;
           ramdisk_compression=auto;
 
           . tools/ak3-core.sh;
+
+          if [ -z "$BLOCK" ] || [ ! -e "$BLOCK" ]; then
+            abort "No se encontro la particion BOOT";
+          fi
+          ui_print "BOOT: $BLOCK";
 
           dump_boot;
           write_boot;
@@ -154,6 +163,15 @@ jobs:
           cat ak3/anykernel.sh
           echo "== Contenido del zip =="
           unzip -l "$ZIP"
+
+          echo "== Verificacion del zip =="
+          unzip -p "$ZIP" anykernel.sh | grep -q 'do.devicecheck=0' || { echo "ERROR: devicecheck no es 0"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'by-name/BOOT' || { echo "ERROR: BLOCK incorrecto"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'patch_cmdline' && { echo "ERROR: quedo patch_cmdline"; exit 1; } || true
+          unzip -l "$ZIP" | grep -qE '[[:space:]]Image$' || { echo "ERROR: falta Image en el zip"; exit 1; }
+          echo "Zip OK"
+          echo "== Version embebida en Image =="
+          strings -n 20 "$B/Image" | grep -m1 'Linux version' || true
 
       - name: Subir zip flasheable
         uses: actions/upload-artifact@v4
@@ -195,7 +213,10 @@ jobs:
               drivers/battery_v2 2>/dev/null | head -n 150 || true
           } > ../audit/driver_capacidad.txt
 
-          head -n 80 ../audit/dts_bateria.txt || true
+          echo "== Lista de fuentes DTS =="
+          head -n 40 ../audit/dts_bateria.txt || true
+          echo "== Seccion a7y18lte del DTS de bateria =="
+          awk '/^--- /{p=($0 ~ /a7y18lte/)} p' ../audit/dts_bateria.txt | head -n 120 || true
 
       - name: Subir artefactos
         if: always()

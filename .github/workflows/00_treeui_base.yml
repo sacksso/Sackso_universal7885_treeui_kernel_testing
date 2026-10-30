@@ -59,17 +59,20 @@ jobs:
           export ARCH=arm64
           export ANDROID_MAJOR_VERSION=q
           export CROSS_COMPILE="$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-"
-          MK="make O=out HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
           $MK "${{ steps.cfg.outputs.def }}"
           if ! $MK -j"$(nproc)" > ../build.log 2>&1; then
             echo "=== PRIMEROS ERRORES (build.log) ==="
             grep -nE 'error:|Error [0-9]+|\*\*\*|undefined reference|No such file' ../build.log | head -n 30
             echo "=== Reintento en serie para aislar el primer error ==="
+            echo "=== Estado de firmware/ ==="
+            ls firmware | head -n 40
+            find firmware -name 'exynos7885_acpm_fvp.fw' || echo "FALTA exynos7885_acpm_fvp.fw en el arbol"
             $MK -j1 > ../build_serial.log 2>&1 || true
             grep -nE -m1 -B8 -A4 'error:|\*\*\*' ../build_serial.log || tail -n 40 ../build_serial.log
             exit 1
           fi
-          ls -la out/arch/arm64/boot/
+          ls -la arch/arm64/boot/
 
       - name: Auditoria de bateria
         run: |
@@ -78,7 +81,7 @@ jobs:
           {
             echo "### defconfig: ${{ steps.cfg.outputs.def }}"
             echo "### CONFIG de bateria/cargador/fuel gauge"
-            grep -iE 'BATTERY|FUELGAUGE|FUEL_GAUGE|CHARGER|MFC|MAX77|S2M|SM5' out/.config | grep -v '^#' || true
+            grep -iE 'BATTERY|FUELGAUGE|FUEL_GAUGE|CHARGER|MFC|MAX77|S2M|SM5' .config | grep -v '^#' || true
           } > ../audit/config_bateria.txt
 
           {
@@ -111,9 +114,9 @@ jobs:
         with:
           name: treeui-base-stock
           path: |
-            kernel/out/arch/arm64/boot/Image*
-            kernel/out/arch/arm64/boot/dts/exynos/*.dtb
-            kernel/out/.config
+            kernel/arch/arm64/boot/Image*
+            kernel/arch/arm64/boot/dts/exynos/*.dtb
+            kernel/.config
             build.log
             build_serial.log
             audit/

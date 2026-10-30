@@ -1,0 +1,296 @@
+name: 05_treeui_etapaC_selinux
+
+# ETAPA C: prueba de SELinux ENFORCING sobre el kernel TreeUI base (sin red, sin BBR).
+# Causa encontrada: el defconfig trae CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=y, que en
+# hooks.c / selinuxfs.c fuerza selinux_enforcing=0 e ignora setenforce 1 y el cmdline.
+# Esta etapa SOLO quita esa opcion (deja DEVELOP=y para poder volver con `setenforce 0`).
+# El resultado es un zip APARTE: conserva el zip base como respaldo y ten TWRP a mano.
+# Regla fija: este arbol de Samsung se compila SIN O=out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig (vacio = autodetectar a7y18lte)"
+        required: false
+        default: ""
+      always_enforce:
+        description: "PELIGRO: ademas fija ALWAYS_ENFORCE=y (setenforce 0 deja de funcionar). Deja false en la primera prueba"
+        type: boolean
+        default: false
+      incluir_dtb:
+        description: "Incluir dtb.img en el zip (esta etapa no toca DTS: deja false)"
+        type: boolean
+        default: false
+      toolchain_repo:
+        description: "Repo del toolchain GCC aarch64"
+        required: false
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      ARCH: arm64
+      ANDROID_MAJOR_VERSION: q
+      CROSS_COMPILE: ${{ github.workspace }}/tc/bin/aarch64-linux-android-
+    steps:
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zip \
+            gcc-9 g++-9 device-tree-compiler binutils
+
+      - name: Clonar kernel TreeUI (sin historial)
+        run: |
+          git clone --depth=1 -b treeui_treble \
+            https://github.com/VDavid003/universal7885_treeui_kernel kernel
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+          git -C kernel log -1 --format='commit %h %s'
+
+      - name: Clonar toolchain
+        run: |
+          git clone --depth=1 "${{ inputs.toolchain_repo }}" tc
+          "$CROSS_COMPILE"gcc --version | head -1
+
+      - name: Elegir defconfig
+        id: cfg
+        run: |
+          cd kernel/arch/arm64/configs
+          DEF="${{ inputs.defconfig }}"
+          if [ -z "$DEF" ]; then
+            DEF=$(ls | grep -iE 'a7y18' | head -1 || true)
+          fi
+          if [ -z "$DEF" ] || [ ! -f "$DEF" ]; then
+            echo "No se autodetecto defconfig. Reejecuta indicando uno de:" >&2
+            ls | grep -iE '7885|a7y18|jackpot' >&2
+            exit 1
+          fi
+          echo "Usando: $DEF"
+          echo "def=$DEF" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # ETAPA C: SELinux
+      # ============================================================
+      - name: Etapa C - estado ANTES (defconfig original)
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+        run: |
+          mkdir -p report
+          cd kernel
+          cp "arch/arm64/configs/$DEF" ../report/defconfig.orig
+          echo "=== SELinux en el defconfig original ==="
+          grep -n 'SELINUX' "arch/arm64/configs/$DEF" | grep -v 'XATTR_SELINUX_LABEL' | tee ../report/selinux-before.txt
+          grep -q '^CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=y' "arch/arm64/configs/$DEF" \
+            || echo "AVISO: el defconfig no tiene NEVER_ENFORCE=y (ya estaba quitado?)"
+
+      - name: Etapa C - quitar NEVER_ENFORCE del defconfig
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+          ALWAYS: ${{ inputs.always_enforce }}
+        run: |
+          cd kernel
+          CFG="arch/arm64/configs/$DEF"
+          sed -i '/^CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=/d;/^# CONFIG_SECURITY_SELINUX_NEVER_ENFORCE is not set/d' "$CFG"
+          echo "# CONFIG_SECURITY_SELINUX_NEVER_ENFORCE is not set" >> "$CFG"
+          # DEVELOP debe seguir en y (permite setenforce 0 para volver atras)
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' "$CFG" || { sed -i '/SECURITY_SELINUX_DEVELOP/d' "$CFG"; echo "CONFIG_SECURITY_SELINUX_DEVELOP=y" >> "$CFG"; }
+          if [ "$ALWAYS" = "true" ]; then
+            sed -i '/^CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=/d;/^# CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE is not set/d' "$CFG"
+            echo "CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=y" >> "$CFG"
+            echo "SEL_MODE=ALWAYS_ENFORCE (setenforce 0 NO funciona)" >> "$GITHUB_ENV"
+          else
+            echo "SEL_MODE=NEVER_ENFORCE quitado (enforcing por cmdline; setenforce 0 funciona)" >> "$GITHUB_ENV"
+          fi
+          echo "=== DIFF del defconfig (lo unico que cambia esta etapa) ==="
+          diff ../report/defconfig.orig "$CFG" || true
+
+      - name: Etapa C - resolver .config y verificar
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+          ALWAYS: ${{ inputs.always_enforce }}
+        run: |
+          cd kernel
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          $MK "$DEF" > ../report/make_defconfig.log 2>&1 || { tail -30 ../report/make_defconfig.log; exit 1; }
+          grep 'SELINUX' .config | grep -v 'XATTR_SELINUX_LABEL' | tee ../report/selinux-after.txt
+          grep -q '^CONFIG_SECURITY_SELINUX=y' .config || { echo "ERROR: SELINUX no esta activo"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' .config || { echo "ERROR: DEVELOP no quedo en y"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=y' .config && { echo "ERROR: NEVER_ENFORCE sigue en y tras resolver"; exit 1; }
+          if [ "$ALWAYS" = "true" ]; then
+            grep -q '^CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=y' .config || { echo "ERROR: ALWAYS_ENFORCE no resolvio"; exit 1; }
+          else
+            grep -q '^CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=y' .config && { echo "ERROR: ALWAYS_ENFORCE quedo en y sin pedirlo"; exit 1; }
+          fi
+          echo "OK: config SELinux correcta"
+
+      # ============================================================
+      # COMPILACION (en el arbol, sin O=out)
+      # ============================================================
+      - name: Compilar
+        run: |
+          cd kernel
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          if ! $MK -j"$(nproc)" > ../build.log 2>&1; then
+            echo "=== PRIMEROS ERRORES (build.log) ==="
+            grep -nE 'error:|Error [0-9]+|\*\*\*|undefined reference|No such file' ../build.log | head -n 30
+            echo "=== Reintento en serie para aislar el primer error ==="
+            $MK -j1 > ../build_serial.log 2>&1 || true
+            grep -nE -m1 -B8 -A4 'error:|\*\*\*' ../build_serial.log || tail -n 40 ../build_serial.log
+            exit 1
+          fi
+          ls -la arch/arm64/boot/
+          [ -f arch/arm64/boot/Image ] || { echo "ERROR: Image no generado"; exit 1; }
+
+      - name: Verificar que el codigo de SELinux compilado ya no fuerza permissive
+        env:
+          ALWAYS: ${{ inputs.always_enforce }}
+        run: |
+          cd kernel
+          R=../report/obj-status.txt
+          : > "$R"
+          for f in security/selinux/selinuxfs.o security/selinux/hooks.o; do
+            [ -f "$f" ] && echo "OK  $f ($(stat -c%s "$f") bytes)" >> "$R" || { echo "FALTA  $f" >> "$R"; }
+          done
+          # La rama NEVER_ENFORCE de sel_write_enforce deja esta cadena en el objeto.
+          if strings -n 8 security/selinux/selinuxfs.o | grep -q 'config_never_enforce'; then
+            echo "FALLA  selinuxfs.o aun contiene la rama config_never_enforce" >> "$R"
+          else
+            echo "OK  selinuxfs.o sin la rama never_enforce" >> "$R"
+          fi
+          if [ "$ALWAYS" != "true" ]; then
+            if strings -n 8 security/selinux/selinuxfs.o | grep -q 'config_always_enforce'; then
+              echo "FALLA  selinuxfs.o contiene la rama always_enforce sin pedirla" >> "$R"
+            else
+              echo "OK  selinuxfs.o sin la rama always_enforce" >> "$R"
+            fi
+          fi
+          if strings -n 8 arch/arm64/boot/Image | grep -q 'config_never_enforce'; then
+            echo "FALLA  la Image aun contiene config_never_enforce" >> "$R"
+          else
+            echo "OK  la Image no contiene config_never_enforce" >> "$R"
+          fi
+          cat "$R"
+          if grep -qE '^(FALTA|FALLA)' "$R"; then echo "ERROR: verificacion de SELinux fallida"; exit 1; fi
+          echo "Version embebida en la Image:"
+          strings -n 20 arch/arm64/boot/Image | grep -m1 'Linux version' || true
+
+      # ============================================================
+      # EMPAQUETADO (igual que la base stock verificada)
+      # ============================================================
+      - name: Clonar AnyKernel3 propio
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/AnyKernel3-a7y18lte
+          token: ${{ secrets.AK3_TOKEN || github.token }}
+          path: ak3
+
+      - name: Empaquetar con AnyKernel3
+        id: pack
+        run: |
+          set -e
+          B=kernel/arch/arm64/boot
+          VER=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | awk '{print $3}' | paste -sd.)
+          SHA=$(git -C kernel rev-parse --short HEAD)
+
+          cat > ak3/anykernel.sh <<'EOF'
+          #!/sbin/sh
+          ## AnyKernel3 setup script - TreeUI etapa C (SELinux enforcing, PRUEBA) a7y18lte
+
+          properties() { '
+          kernel.string=TreeUI etapa C __VER__ (a7y18lte) - SELinux enforcing PRUEBA
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=;
+          for p in /dev/block/by-name/BOOT \
+                   /dev/block/platform/13500000.dwmmc0/by-name/BOOT \
+                   /dev/block/bootdevice/by-name/BOOT; do
+            if [ -e "$p" ]; then BLOCK=$p; break; fi
+          done
+          is_slot_device=0;
+          ramdisk_compression=auto;
+
+          . tools/ak3-core.sh;
+
+          if [ -z "$BLOCK" ] || [ ! -e "$BLOCK" ]; then
+            abort "No se encontro la particion BOOT";
+          fi
+          ui_print "BOOT: $BLOCK";
+
+          dump_boot;
+          write_boot;
+          EOF
+          sed -i "s/__VER__/${VER}/" ak3/anykernel.sh
+
+          find ak3/ramdisk -mindepth 1 -delete 2>/dev/null || true
+          rm -f ak3/Image ak3/Image.gz* ak3/zImage* ak3/dtb ak3/dtb.img ak3/*.zip
+          cp "$B/Image" ak3/Image
+          if [ "${{ inputs.incluir_dtb }}" = "true" ]; then
+            cp "$B/dtb.img" ak3/dtb.img
+            cp "$B/dtb.img" ak3/dtb
+            DTB=withdtb
+          else
+            DTB=imageonly
+          fi
+
+          cat > ak3/build-info.txt <<EOF
+          TreeUI etapa C (SELinux, PRUEBA)
+          Kernel: $VER (commit $SHA)  defconfig: ${{ steps.cfg.outputs.def }}
+          Modo: ${SEL_MODE:-desconocido}
+          --- SELinux antes ---
+          $(cat report/selinux-before.txt)
+          --- SELinux despues ---
+          $(cat report/selinux-after.txt)
+          --- verificacion del codigo compilado ---
+          $(cat report/obj-status.txt)
+          EOF
+
+          ZIP="TreeUI-a7y18lte-etapaC-selinux-${VER}-${SHA}-${DTB}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git/*' '.github/*' '*.md')
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          unzip -l "$ZIP"
+          unzip -p "$ZIP" anykernel.sh | grep -q 'do.devicecheck=0' || { echo "ERROR: devicecheck no es 0"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'by-name/BOOT' || { echo "ERROR: BLOCK incorrecto"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'patch_cmdline' && { echo "ERROR: quedo patch_cmdline"; exit 1; } || true
+          unzip -l "$ZIP" | grep -qE '[[:space:]]Image$' || { echo "ERROR: falta Image en el zip"; exit 1; }
+          echo "Zip OK"
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "## Etapa C - SELinux"
+            echo "Modo: ${SEL_MODE:-?}"
+            echo '```'
+            cat report/selinux-before.txt 2>/dev/null
+            echo '--- despues ---'
+            cat report/selinux-after.txt 2>/dev/null
+            echo '--- codigo compilado ---'
+            cat report/obj-status.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir zip flasheable
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-etapaC-selinux-flashable
+          path: ${{ steps.pack.outputs.zip }}
+
+      - name: Subir informes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-etapaC-selinux-report
+          path: |
+            report/
+            kernel/.config
+            build.log
+            build_serial.log

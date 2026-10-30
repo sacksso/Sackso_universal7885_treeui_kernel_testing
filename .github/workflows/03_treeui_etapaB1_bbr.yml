@@ -192,6 +192,9 @@ jobs:
           echo "CONFIG_DEFAULT_CUBIC=y" >> "$CFG"
           if [ "${{ inputs.bbr_default }}" = "true" ]; then
             sed -i '/^CONFIG_DEFAULT_CUBIC=y/d' "$CFG"
+            # TCP_CONG_BBR=y debe ir ANTES de DEFAULT_BBR: la opcion de la choice solo es
+            # visible si TCP_CONG_BBR=y ya se leyo (si no, kconfig la descarta y no queda ninguna)
+            set_y TCP_CONG_BBR
             echo "CONFIG_DEFAULT_BBR=y" >> "$CFG"
           fi
 
@@ -209,7 +212,7 @@ jobs:
 
           : > "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"
           for o in $OPTS; do
-            if has_sym "$o"; then set_y "$o"; else echo "$o" >> "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; fi
+            if has_sym "$o"; then grep -q "^CONFIG_$o=y" "$CFG" || set_y "$o"; else echo "$o" >> "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; fi
           done
           [ -s "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt" ] && { echo "AVISO - simbolos sin Kconfig en este arbol (omitidos):"; cat "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; }
 

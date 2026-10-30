@@ -59,8 +59,16 @@ jobs:
           export ARCH=arm64
           export ANDROID_MAJOR_VERSION=q
           export CROSS_COMPILE="$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-"
-          make O=out HOSTCC=gcc-9 HOSTCXX=g++-9 "${{ steps.cfg.outputs.def }}"
-          make O=out HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error -j"$(nproc)" 2>&1 | tee ../build.log | tail -n 40
+          MK="make O=out HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          $MK "${{ steps.cfg.outputs.def }}"
+          if ! $MK -j"$(nproc)" > ../build.log 2>&1; then
+            echo "=== PRIMEROS ERRORES (build.log) ==="
+            grep -nE 'error:|Error [0-9]+|\*\*\*|undefined reference|No such file' ../build.log | head -n 30
+            echo "=== Reintento en serie para aislar el primer error ==="
+            $MK -j1 > ../build_serial.log 2>&1 || true
+            grep -nE -m1 -B8 -A4 'error:|\*\*\*' ../build_serial.log || tail -n 40 ../build_serial.log
+            exit 1
+          fi
           ls -la out/arch/arm64/boot/
 
       - name: Auditoria de bateria
@@ -98,6 +106,7 @@ jobs:
           cat ../audit/dts_bateria.txt | head -n 80
 
       - name: Subir artefactos
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: treeui-base-stock
@@ -106,4 +115,5 @@ jobs:
             kernel/out/arch/arm64/boot/dts/exynos/*.dtb
             kernel/out/.config
             build.log
+            build_serial.log
             audit/

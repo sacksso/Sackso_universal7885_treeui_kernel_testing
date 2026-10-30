@@ -114,16 +114,33 @@ jobs:
             echo "metodo=git apply limpio" > ../report/bbr_method.txt
           else
             echo "git apply estricto NO aplica; primeros errores:"; head -30 ../report/bbr_check.err
-            echo "--- prueba con patch -F3 (dry-run) ---"
-            if patch -p1 -F3 --dry-run < "$P" > ../report/bbr_dry.log 2>&1; then
-              cat ../report/bbr_dry.log | grep -E 'FAILED|fuzz|offset' | head -20 || true
-              patch -p1 -F3 --no-backup-if-mismatch < "$P" > ../report/bbr_apply.log 2>&1
-              echo "metodo=patch -F3 (con fuzz/offset)" > ../report/bbr_method.txt
-            else
-              echo "ERROR: el parche NO aplica en TreeUI. Hunks fallidos:"
-              grep -E 'FAILED|can.t find|Hunk' ../report/bbr_dry.log | head -40
-              exit 1
+            echo "--- patch -F3: aplica lo que entra y reporta los hunks que no ---"
+            patch -p1 -F3 --no-backup-if-mismatch < "$P" > ../report/bbr_apply.log 2>&1 || true
+            grep -E 'FAILED|fuzz' ../report/bbr_apply.log | head -20 || true
+            REJ=$(find . -name '*.rej' | sort | tr '\n' ' ')
+            echo "Archivos con rechazos: ${REJ:-ninguno}"
+            # Solo se toleran los 2 rechazos YA CONOCIDOS (4.4.185 difiere de 4.4.302 en esas 2 lineas)
+            for r in $REJ; do
+              case "$r" in
+                ./include/linux/tcp.h.rej|./lib/Makefile.rej) ;;
+                *) echo "ERROR: rechazo inesperado: $r"; cat "$r" | head -40; exit 1;;
+              esac
+            done
+            # --- correccion manual 1: lib/Makefile (win_minmax.o) ---
+            if [ -f lib/Makefile.rej ]; then
+              grep -q 'win_minmax.o' lib/Makefile || printf '\nlib-y += win_minmax.o\n' >> lib/Makefile
+              rm -f lib/Makefile.rej
+              grep -n 'win_minmax' lib/Makefile || { echo "ERROR: lib/Makefile sin win_minmax"; exit 1; }
             fi
+            # --- correccion manual 2: include/linux/tcp.h (bit rate_app_limited) ---
+            if [ -f include/linux/tcp.h.rej ]; then
+              grep -q 'rate_app_limited' include/linux/tcp.h || \
+                sed -i '/^[[:space:]]*u32[[:space:]]*rate_interval_us;/a\\tu8\trate_app_limited:1;  /* rate_{delivered,interval_us} limited? */' include/linux/tcp.h
+              rm -f include/linux/tcp.h.rej
+              grep -n 'rate_interval_us\|rate_app_limited' include/linux/tcp.h || { echo "ERROR: tcp.h sin rate_app_limited"; exit 1; }
+              [ "$(grep -c 'rate_app_limited' include/linux/tcp.h)" = 1 ] || { echo "ERROR: rate_app_limited duplicado o ausente"; exit 1; }
+            fi
+            echo "metodo=patch -F3 + 2 correcciones manuales (tcp.h bit, lib/Makefile)" > ../report/bbr_method.txt
           fi
           echo "=== verificaciones post-parche ==="
           find . -name '*.rej' -o -name '*.orig' | head && true

@@ -1,0 +1,109 @@
+name: 00_treeui_base
+
+# Base stock: compila el kernel de TreeUI SIN modificaciones y genera una
+# auditoria de bateria (dts + driver + .config) para revisar la calibracion.
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig (vacio = autodetectar a7y18lte/jackpotlte)"
+        required: false
+        default: ""
+      toolchain_repo:
+        description: "Repo del toolchain GCC aarch64"
+        required: false
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zip \
+            gcc-9 g++-9 device-tree-compiler
+
+      - name: Clonar kernel TreeUI (sin historial)
+        run: |
+          git clone --depth=1 -b treeui_treble \
+            https://github.com/VDavid003/universal7885_treeui_kernel kernel
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+
+      - name: Clonar toolchain
+        run: |
+          git clone --depth=1 "${{ inputs.toolchain_repo }}" tc
+          ls tc/bin | grep gcc | head -3
+
+      - name: Elegir defconfig
+        id: cfg
+        run: |
+          cd kernel/arch/arm64/configs
+          echo "== defconfigs disponibles =="
+          ls | grep -i -E '7885|a7y18|jackpot|a8|a7' || true
+          DEF="${{ inputs.defconfig }}"
+          if [ -z "$DEF" ]; then
+            DEF=$(ls | grep -i -E 'a7y18|jackpot' | head -1 || true)
+          fi
+          if [ -z "$DEF" ]; then
+            echo "No se autodetecto defconfig. Reejecuta indicando uno de la lista." >&2
+            exit 1
+          fi
+          echo "Usando: $DEF"
+          echo "def=$DEF" >> "$GITHUB_OUTPUT"
+
+      - name: Compilar base stock
+        run: |
+          cd kernel
+          export ARCH=arm64
+          export ANDROID_MAJOR_VERSION=q
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-"
+          make O=out HOSTCC=gcc-9 HOSTCXX=g++-9 "${{ steps.cfg.outputs.def }}"
+          make O=out HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error -j"$(nproc)" 2>&1 | tee ../build.log | tail -n 40
+          ls -la out/arch/arm64/boot/
+
+      - name: Auditoria de bateria
+        run: |
+          mkdir -p audit
+          cd kernel
+          {
+            echo "### defconfig: ${{ steps.cfg.outputs.def }}"
+            echo "### CONFIG de bateria/cargador/fuel gauge"
+            grep -iE 'BATTERY|FUELGAUGE|FUEL_GAUGE|CHARGER|MFC|MAX77|S2M|SM5' out/.config | grep -v '^#' || true
+          } > ../audit/config_bateria.txt
+
+          {
+            echo "### Archivos del driver de bateria"
+            ls -la drivers/battery_v2 drivers/battery 2>/dev/null || true
+          } > ../audit/driver_archivos.txt
+
+          {
+            echo "### DTS del dispositivo"
+            find arch/arm64/boot/dts -iname '*jackpot*' -o -iname '*a7y18*' | sort
+            echo
+            echo "### Valores de capacidad / fuelgauge / battery en esos DTS"
+            for f in $(find arch/arm64/boot/dts -iname '*jackpot*' -o -iname '*a7y18*'); do
+              echo "--- $f"
+              grep -nE 'capacity|fuelgauge,|battery,(full|chg|swelling|temp|vfloat|input|normal)|battery_data|cycle' "$f" || true
+            done
+          } > ../audit/dts_bateria.txt
+
+          {
+            echo "### Referencias a capacidad en el driver"
+            grep -rnE 'capacity_max|capacity_min|capacity_calculation|batt_full_capacity|full_capacity|design' \
+              drivers/battery_v2 2>/dev/null | head -n 150 || true
+          } > ../audit/driver_capacidad.txt
+
+          cat ../audit/dts_bateria.txt | head -n 80
+
+      - name: Subir artefactos
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-base-stock
+          path: |
+            kernel/out/arch/arm64/boot/Image*
+            kernel/out/arch/arm64/boot/dts/exynos/*.dtb
+            kernel/out/.config
+            build.log
+            audit/

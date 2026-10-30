@@ -10,6 +10,10 @@ on:
         description: "Defconfig (vacio = autodetectar a7y18lte/jackpotlte)"
         required: false
         default: ""
+      incluir_dtb:
+        description: "Incluir dtb.img en el zip (primera prueba: SIN dtb)"
+        type: boolean
+        default: false
       toolchain_repo:
         description: "Repo del toolchain GCC aarch64"
         required: false
@@ -74,6 +78,89 @@ jobs:
           fi
           ls -la arch/arm64/boot/
 
+      - name: Clonar AnyKernel3 propio
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/AnyKernel3-a7y18lte
+          token: ${{ secrets.AK3_TOKEN || github.token }}
+          path: ak3
+
+      - name: Empaquetar con AnyKernel3
+        id: pack
+        run: |
+          set -e
+          B=kernel/arch/arm64/boot
+          echo "== anykernel.sh ORIGINAL de tu repo (solo para registro) =="
+          grep -nE '^(kernel\.string|do\.|device\.name|BLOCK|is_slot_device|ramdisk_compression|patch_cmdline)' ak3/anykernel.sh || true
+          echo "== ramdisk/ de tu repo (se VACIA en la base stock) =="
+          ls -laR ak3/ramdisk || true
+          echo "== tools/ =="
+          ls ak3/tools || true
+
+          VER=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | awk '{print $3}' | paste -sd.)
+          SHA=$(git -C kernel rev-parse --short HEAD)
+
+          # Base stock: sin overclock (cpu_max_c1), sin parches de ramdisk de Lineage.
+          # Se conservan BLOCK y device names de tu anykernel.sh.
+          cat > ak3/anykernel.sh <<'EOF'
+          #!/sbin/sh
+          ## AnyKernel3 setup script - TreeUI base stock (a7y18lte)
+
+          properties() { '
+          kernel.string=TreeUI base stock __VER__ (a7y18lte) - sin modificaciones
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a7y18lte
+          device.name2=SM-A750F
+          device.name3=SM-A750FN
+          device.name4=SM-A750G
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=/dev/block/platform/13500000.dwmmc0/by-name/BOOT;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+          sed -i "s/__VER__/${VER}/" ak3/anykernel.sh
+
+          # vaciar ramdisk/ (AK3 copia su contenido encima del ramdisk de la ROM)
+          find ak3/ramdisk -mindepth 1 -delete 2>/dev/null || true
+
+          # quitar restos de otros kernels y copiar los de esta build
+          rm -f ak3/Image ak3/Image.gz* ak3/zImage* ak3/dtb ak3/dtb.img ak3/*.zip
+          cp "$B/Image" ak3/Image
+          if [ "${{ inputs.incluir_dtb }}" = "true" ]; then
+            cp "$B/dtb.img" ak3/dtb.img
+            cp "$B/dtb.img" ak3/dtb
+            DTB=withdtb
+          else
+            DTB=imageonly
+          fi
+
+          ZIP="TreeUI-a7y18lte-base-${VER}-${SHA}-${DTB}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git/*' '.github/*' '*.md')
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "== anykernel.sh generado =="
+          cat ak3/anykernel.sh
+          echo "== Contenido del zip =="
+          unzip -l "$ZIP"
+
+      - name: Subir zip flasheable
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-a7y18lte-flashable
+          path: ${{ steps.pack.outputs.zip }}
+
       - name: Auditoria de bateria
         run: |
           mkdir -p audit
@@ -90,13 +177,15 @@ jobs:
           } > ../audit/driver_archivos.txt
 
           {
-            echo "### DTS del dispositivo"
-            find arch/arm64/boot/dts -iname '*jackpot*' -o -iname '*a7y18*' | sort
+            echo "### Fuentes DTS/DTSI del dispositivo"
+            find arch/arm64/boot/dts -type f \( -name '*.dts' -o -name '*.dtsi' \) \
+              \( -iname '*a7y18*' -o -iname '*jackpot*' -o -iname '*battery*' -o -iname '*fuelgauge*' \) | sort
             echo
-            echo "### Valores de capacidad / fuelgauge / battery en esos DTS"
-            for f in $(find arch/arm64/boot/dts -iname '*jackpot*' -o -iname '*a7y18*'); do
+            echo "### Valores de capacidad / fuelgauge / battery en esas fuentes"
+            for f in $(find arch/arm64/boot/dts -type f \( -name '*.dts' -o -name '*.dtsi' \) \
+              \( -iname '*a7y18*' -o -iname '*jackpot*' -o -iname '*battery*' -o -iname '*fuelgauge*' \) | sort); do
               echo "--- $f"
-              grep -nE 'capacity|fuelgauge,|battery,(full|chg|swelling|temp|vfloat|input|normal)|battery_data|cycle' "$f" || true
+              grep -naE 'capacity|fuelgauge,|battery,(full|chg|swelling|temp|vfloat|input|normal)|battery_data|cycle' "$f" || true
             done
           } > ../audit/dts_bateria.txt
 
@@ -106,7 +195,7 @@ jobs:
               drivers/battery_v2 2>/dev/null | head -n 150 || true
           } > ../audit/driver_capacidad.txt
 
-          cat ../audit/dts_bateria.txt | head -n 80
+          head -n 80 ../audit/dts_bateria.txt || true
 
       - name: Subir artefactos
         if: always()
@@ -115,6 +204,7 @@ jobs:
           name: treeui-base-stock
           path: |
             kernel/arch/arm64/boot/Image*
+            kernel/arch/arm64/boot/dtb.img
             kernel/arch/arm64/boot/dts/exynos/*.dtb
             kernel/.config
             build.log

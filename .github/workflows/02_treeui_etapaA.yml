@@ -1,0 +1,366 @@
+name: 02_treeui_etapaA
+
+# ETAPA A: solo CONFIGURACION de red sobre el kernel TreeUI (sin tocar codigo).
+#   - cubic como TCP por defecto (choice del Kconfig, igual que en Lineage)
+#   - fq y qdiscs extra, algoritmos TCP extra (el default sigue siendo cubic)
+#   - TTL/HL (xt_HL), USB ethernet extra, pktgen / drop_monitor
+# Cada simbolo se verifica en el .config resuelto y, tras compilar, se comprueba
+# que existan los objetos (.o) correspondientes. Si un simbolo no resuelve por
+# dependencias NO falla el build: queda en el informe (salvo los 2 criticos).
+# Regla fija: este arbol de Samsung se compila SIN O=out.
+# BBR, BFQ, gobernadores y SELinux NO van aqui (Etapas B y C).
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig (vacio = autodetectar a7y18lte)"
+        required: false
+        default: ""
+      tcp_extra:
+        description: "Algoritmos TCP extra (cdg vegas veno illinois yeah hybla highspeed scalable lp)"
+        type: boolean
+        default: true
+      qdisc_extra:
+        description: "fq + qdiscs extra (fq_codel codel pie sfq netem tbf)"
+        type: boolean
+        default: true
+      ttl_hl:
+        description: "TTL/HL spoofing (NETFILTER_XT_TARGET_HL)"
+        type: boolean
+        default: true
+      usb_eth:
+        description: "Drivers USB ethernet extra (rndis_host lan78xx dm9601 sr9700 mcs7830)"
+        type: boolean
+        default: true
+      net_diag:
+        description: "Diagnostico de red (pktgen, drop_monitor)"
+        type: boolean
+        default: true
+      wifi_ps_off:
+        description: "Desactivar ahorro de energia Wi-Fi por defecto del kernel (efecto incierto; deja false)"
+        type: boolean
+        default: false
+      incluir_dtb:
+        description: "Incluir dtb.img en el zip (esta etapa no toca DTS: deja false)"
+        type: boolean
+        default: false
+      toolchain_repo:
+        description: "Repo del toolchain GCC aarch64"
+        required: false
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      ARCH: arm64
+      ANDROID_MAJOR_VERSION: q
+      CROSS_COMPILE: ${{ github.workspace }}/tc/bin/aarch64-linux-android-
+    steps:
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zip \
+            gcc-9 g++-9 device-tree-compiler binutils
+
+      - name: Clonar kernel TreeUI (sin historial)
+        run: |
+          git clone --depth=1 -b treeui_treble \
+            https://github.com/VDavid003/universal7885_treeui_kernel kernel
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+          git -C kernel log -1 --format='commit %h %s'
+
+      - name: Clonar toolchain
+        run: |
+          git clone --depth=1 "${{ inputs.toolchain_repo }}" tc
+          "$CROSS_COMPILE"gcc --version | head -1
+
+      - name: Elegir defconfig
+        id: cfg
+        run: |
+          cd kernel/arch/arm64/configs
+          DEF="${{ inputs.defconfig }}"
+          if [ -z "$DEF" ]; then
+            DEF=$(ls | grep -iE 'a7y18' | head -1 || true)
+          fi
+          if [ -z "$DEF" ] || [ ! -f "$DEF" ]; then
+            echo "No se autodetecto defconfig. Reejecuta indicando uno de:" >&2
+            ls | grep -iE '7885|a7y18|jackpot' >&2
+            exit 1
+          fi
+          echo "Usando: $DEF"
+          echo "def=$DEF" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # ETAPA A: aplicar config de red
+      # ============================================================
+      - name: Etapa A - aplicar config de red al defconfig
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+          TCP_EXTRA: ${{ inputs.tcp_extra }}
+          QDISC_EXTRA: ${{ inputs.qdisc_extra }}
+          TTL_HL: ${{ inputs.ttl_hl }}
+          USB_ETH: ${{ inputs.usb_eth }}
+          NET_DIAG: ${{ inputs.net_diag }}
+          WIFI_PS_OFF: ${{ inputs.wifi_ps_off }}
+        run: |
+          cd kernel
+          CFG="arch/arm64/configs/$DEF"
+          mkdir -p "$GITHUB_WORKSPACE/report"
+          cp "$CFG" "$GITHUB_WORKSPACE/report/defconfig.orig"
+
+          # indice de simbolos Kconfig (para saltar los que no existen en este arbol)
+          grep -rhoE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' --include='Kconfig*' . \
+            | awk '{print $NF}' | sort -u > "$GITHUB_WORKSPACE/report/kconfig_symbols.txt"
+          has_sym() { grep -qx "$1" "$GITHUB_WORKSPACE/report/kconfig_symbols.txt"; }
+
+          set_y() {
+            sed -i "/^# CONFIG_$1 is not set/d;/^CONFIG_$1=/d" "$CFG"
+            echo "CONFIG_$1=y" >> "$CFG"
+          }
+
+          echo "=== ANTES: lineas de la choice TCP en el defconfig ==="
+          grep -nE 'CONFIG_(DEFAULT_(BIC|CUBIC|HTCP|HYBLA|VEGAS|VENO|WESTWOOD|DCTCP|CDG|BBR|RENO)|DEFAULT_TCP_CONG|TCP_CONG_ADVANCED|TCP_CONG_CUBIC)' "$CFG" || echo "(ninguna)"
+
+          # ---- cubic como default (la choice solo admite UNA seleccion) ----
+          sed -i -E '/^(# )?CONFIG_DEFAULT_(BIC|CUBIC|HTCP|HYBLA|VEGAS|VENO|WESTWOOD|DCTCP|CDG|BBR|RENO)[ =]/d;/^CONFIG_DEFAULT_TCP_CONG=/d' "$CFG"
+          set_y TCP_CONG_ADVANCED
+          set_y TCP_CONG_CUBIC
+          echo "CONFIG_DEFAULT_CUBIC=y" >> "$CFG"
+
+          OPTS=""
+          [ "$TCP_EXTRA" = "true" ]   && OPTS="$OPTS TCP_CONG_CDG TCP_CONG_VEGAS TCP_CONG_VENO TCP_CONG_ILLINOIS TCP_CONG_YEAH TCP_CONG_HYBLA TCP_CONG_HSTCP TCP_CONG_SCALABLE TCP_CONG_LP"
+          [ "$QDISC_EXTRA" = "true" ] && OPTS="$OPTS NET_SCH_FQ NET_SCH_FQ_CODEL NET_SCH_CODEL NET_SCH_PIE NET_SCH_SFQ NET_SCH_NETEM NET_SCH_TBF"
+          [ "$TTL_HL" = "true" ]      && OPTS="$OPTS NETFILTER_XT_TARGET_HL"
+          [ "$NET_DIAG" = "true" ]    && OPTS="$OPTS NET_PKTGEN NET_DROP_MONITOR"
+          if [ "$USB_ETH" = "true" ]; then
+            # los drivers USB ethernet dependen de USB_USBNET
+            for dep in USB_NET_DRIVERS USB_USBNET; do has_sym "$dep" && set_y "$dep"; done
+            OPTS="$OPTS USB_NET_RNDIS_HOST USB_LAN78XX USB_NET_DM9601 USB_NET_SR9700 USB_NET_MCS7830"
+          fi
+          echo "$OPTS" | xargs -n1 > "$GITHUB_WORKSPACE/report/opts.txt"
+
+          : > "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"
+          for o in $OPTS; do
+            if has_sym "$o"; then set_y "$o"; else echo "$o" >> "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; fi
+          done
+          [ -s "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt" ] && { echo "AVISO - simbolos sin Kconfig en este arbol (omitidos):"; cat "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; }
+
+          if [ "$WIFI_PS_OFF" = "true" ]; then
+            sed -i 's/^CONFIG_CFG80211_DEFAULT_PS=y/# CONFIG_CFG80211_DEFAULT_PS is not set/' "$CFG"
+            echo "WIFI_PS=desactivado (input wifi_ps_off=true)" >> "$GITHUB_ENV"
+          else
+            echo "WIFI_PS=por defecto del kernel (sin cambios)" >> "$GITHUB_ENV"
+          fi
+
+          echo "=== DIFF del defconfig (lo unico que cambia esta etapa) ==="
+          diff "$GITHUB_WORKSPACE/report/defconfig.orig" "$CFG" || true
+
+      - name: Etapa A - resolver .config y verificar cada simbolo
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+        run: |
+          cd kernel
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          $MK "$DEF" > ../report/make_defconfig.log 2>&1 || { tail -30 ../report/make_defconfig.log; exit 1; }
+          R=../report/net-status.txt
+          : > "$R"
+          ok=0; tot=0
+          for o in $(cat ../report/opts.txt); do
+            tot=$((tot+1))
+            if grep -q "^CONFIG_$o=y" .config; then ok=$((ok+1)); echo "OK  $o" >> "$R"
+            elif grep -qx "$o" ../report/skipped_no_kconfig.txt; then echo "NO  $o (no existe en el Kconfig de este arbol)" >> "$R"
+            else echo "NO  $o (no resolvio: dependencia sin cumplir)" >> "$R"; fi
+          done
+          cat "$R"
+          echo "Resueltas: $ok de $tot"
+          echo "NET_SUMMARY=$ok de $tot activas" >> "$GITHUB_ENV"
+
+          echo "=== CRITICOS (si fallan, aborta) ==="
+          grep -q "^CONFIG_TCP_CONG_CUBIC=y" .config || { echo "ERROR: cubic no esta compilado"; exit 1; }
+          grep -q '^CONFIG_DEFAULT_TCP_CONG="cubic"' .config || { echo "ERROR: el TCP por defecto NO quedo en cubic"; grep -n "DEFAULT_TCP_CONG\|CONFIG_DEFAULT_" .config | head; exit 1; }
+          if [ "${{ inputs.qdisc_extra }}" = "true" ]; then
+            grep -q "^CONFIG_NET_SCH_FQ=y" .config || { echo "ERROR: fq no quedo activo"; grep -n "NET_SCHED\|NET_SCH_FQ" .config; exit 1; }
+          fi
+          grep -E 'DEFAULT_TCP_CONG|^CONFIG_NET_SCHED=|CONFIG_MPTCP=|CONFIG_USB_USBNET' .config
+
+          echo "=== INFO: prerrequisitos de TTL/HL (iptables necesita las tablas mangle) ==="
+          grep -E 'CONFIG_(IP_NF_MANGLE|IP6_NF_MANGLE|NETFILTER_XT_TARGET_HL|NETFILTER_XT_MATCH_HL|IP_NF_TARGET_TTL|NETFILTER_ADVANCED)=' .config || echo "(ninguno resuelto)"
+          echo "=== INFO: Wi-Fi PS ==="
+          grep -n "CFG80211_DEFAULT_PS" .config || true
+
+      # ============================================================
+      # COMPILACION (en el arbol, sin O=out)
+      # ============================================================
+      - name: Compilar
+        run: |
+          cd kernel
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          if ! $MK -j"$(nproc)" > ../build.log 2>&1; then
+            echo "=== PRIMEROS ERRORES (build.log) ==="
+            grep -nE 'error:|Error [0-9]+|\*\*\*|undefined reference|No such file' ../build.log | head -n 30
+            echo "=== Reintento en serie para aislar el primer error ==="
+            $MK -j1 > ../build_serial.log 2>&1 || true
+            grep -nE -m1 -B8 -A4 'error:|\*\*\*' ../build_serial.log || tail -n 40 ../build_serial.log
+            exit 1
+          fi
+          ls -la arch/arm64/boot/
+          [ -f arch/arm64/boot/Image ] || { echo "ERROR: Image no generado"; exit 1; }
+
+      - name: Verificar que los objetos se compilaron de verdad
+        run: |
+          cd kernel
+          R=../report/obj-status.txt
+          : > "$R"
+          chk() { # chk <CONFIG sin prefijo> <ruta .o>
+            grep -q "^CONFIG_$1=y" .config || return 0
+            if [ -f "$2" ]; then echo "OK  $2 ($(stat -c%s "$2") bytes)" >> "$R"; else echo "FALTA  $2 (CONFIG_$1=y pero no hay objeto)" >> "$R"; fi
+          }
+          chk TCP_CONG_CUBIC net/ipv4/tcp_cubic.o
+          chk TCP_CONG_CDG net/ipv4/tcp_cdg.o
+          chk TCP_CONG_VEGAS net/ipv4/tcp_vegas.o
+          chk TCP_CONG_VENO net/ipv4/tcp_veno.o
+          chk TCP_CONG_ILLINOIS net/ipv4/tcp_illinois.o
+          chk TCP_CONG_YEAH net/ipv4/tcp_yeah.o
+          chk TCP_CONG_HYBLA net/ipv4/tcp_hybla.o
+          chk TCP_CONG_HSTCP net/ipv4/tcp_highspeed.o
+          chk TCP_CONG_SCALABLE net/ipv4/tcp_scalable.o
+          chk TCP_CONG_LP net/ipv4/tcp_lp.o
+          chk NET_SCH_FQ net/sched/sch_fq.o
+          chk NET_SCH_FQ_CODEL net/sched/sch_fq_codel.o
+          chk NET_SCH_CODEL net/sched/sch_codel.o
+          chk NET_SCH_PIE net/sched/sch_pie.o
+          chk NET_SCH_SFQ net/sched/sch_sfq.o
+          chk NET_SCH_NETEM net/sched/sch_netem.o
+          chk NET_SCH_TBF net/sched/sch_tbf.o
+          chk NETFILTER_XT_TARGET_HL net/netfilter/xt_HL.o
+          chk NET_PKTGEN net/core/pktgen.o
+          chk NET_DROP_MONITOR net/core/drop_monitor.o
+          chk USB_NET_RNDIS_HOST drivers/net/usb/rndis_host.o
+          chk USB_LAN78XX drivers/net/usb/lan78xx.o
+          chk USB_NET_DM9601 drivers/net/usb/dm9601.o
+          chk USB_NET_SR9700 drivers/net/usb/sr9700.o
+          chk USB_NET_MCS7830 drivers/net/usb/mcs7830.o
+          cat "$R"
+          if grep -q '^FALTA' "$R"; then echo "ERROR: hay opciones activas sin objeto compilado"; exit 1; fi
+          echo "Version embebida en la Image:"
+          strings -n 20 arch/arm64/boot/Image | grep -m1 'Linux version' || true
+
+      # ============================================================
+      # EMPAQUETADO (igual que la base stock verificada)
+      # ============================================================
+      - name: Clonar AnyKernel3 propio
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/AnyKernel3-a7y18lte
+          token: ${{ secrets.AK3_TOKEN || github.token }}
+          path: ak3
+
+      - name: Empaquetar con AnyKernel3
+        id: pack
+        run: |
+          set -e
+          B=kernel/arch/arm64/boot
+          VER=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | awk '{print $3}' | paste -sd.)
+          SHA=$(git -C kernel rev-parse --short HEAD)
+
+          cat > ak3/anykernel.sh <<'EOF'
+          #!/sbin/sh
+          ## AnyKernel3 setup script - TreeUI etapa A (config de red) a7y18lte
+
+          properties() { '
+          kernel.string=TreeUI etapa A __VER__ (a7y18lte) - config de red
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=;
+          for p in /dev/block/by-name/BOOT \
+                   /dev/block/platform/13500000.dwmmc0/by-name/BOOT \
+                   /dev/block/bootdevice/by-name/BOOT; do
+            if [ -e "$p" ]; then BLOCK=$p; break; fi
+          done
+          is_slot_device=0;
+          ramdisk_compression=auto;
+
+          . tools/ak3-core.sh;
+
+          if [ -z "$BLOCK" ] || [ ! -e "$BLOCK" ]; then
+            abort "No se encontro la particion BOOT";
+          fi
+          ui_print "BOOT: $BLOCK";
+
+          dump_boot;
+          write_boot;
+          EOF
+          sed -i "s/__VER__/${VER}/" ak3/anykernel.sh
+
+          find ak3/ramdisk -mindepth 1 -delete 2>/dev/null || true
+          rm -f ak3/Image ak3/Image.gz* ak3/zImage* ak3/dtb ak3/dtb.img ak3/*.zip
+          cp "$B/Image" ak3/Image
+          if [ "${{ inputs.incluir_dtb }}" = "true" ]; then
+            cp "$B/dtb.img" ak3/dtb.img
+            cp "$B/dtb.img" ak3/dtb
+            DTB=withdtb
+          else
+            DTB=imageonly
+          fi
+
+          cat > ak3/build-info.txt <<EOF
+          TreeUI etapa A (solo config de red)
+          Kernel: $VER (commit $SHA)  defconfig: ${{ steps.cfg.outputs.def }}
+          TCP default: cubic
+          Opciones activas: ${NET_SUMMARY:-desconocido}
+          Wi-Fi PS: ${WIFI_PS:-sin cambios}
+          --- estado por simbolo ---
+          $(cat report/net-status.txt)
+          --- objetos compilados ---
+          $(cat report/obj-status.txt)
+          EOF
+
+          ZIP="TreeUI-a7y18lte-etapaA-${VER}-${SHA}-${DTB}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git/*' '.github/*' '*.md')
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          unzip -l "$ZIP"
+          unzip -p "$ZIP" anykernel.sh | grep -q 'do.devicecheck=0' || { echo "ERROR: devicecheck no es 0"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'by-name/BOOT' || { echo "ERROR: BLOCK incorrecto"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'patch_cmdline' && { echo "ERROR: quedo patch_cmdline"; exit 1; } || true
+          unzip -l "$ZIP" | grep -qE '[[:space:]]Image$' || { echo "ERROR: falta Image en el zip"; exit 1; }
+          echo "Zip OK"
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "## Etapa A - config de red"
+            echo "Opciones: ${NET_SUMMARY:-?}"
+            echo '```'
+            cat report/net-status.txt 2>/dev/null
+            echo '--- objetos ---'
+            cat report/obj-status.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir zip flasheable
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-etapaA-flashable
+          path: ${{ steps.pack.outputs.zip }}
+
+      - name: Subir informes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-etapaA-report
+          path: |
+            report/
+            kernel/.config
+            build.log
+            build_serial.log

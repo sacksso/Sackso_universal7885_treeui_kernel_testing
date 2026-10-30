@@ -1,0 +1,397 @@
+name: 01_treeui_diag
+
+# DIAGNOSTICO (no compila el kernel salvo que actives try_build_bbr).
+# Objetivo: saber, ANTES de portar nada, que de lo hecho en el kernel de
+# Lineage aplica, falta o hay que adaptar en el kernel de TreeUI.
+# Resultado: "Resumen" en la pestaña Summary del run + artefacto diag/.
+# Estados: OK = listo/aplica | ADAPT = hay que adaptarlo | FALTA = no existe | INFO = dato
+#
+# OPCIONAL: sube bbr-backport.patch a la raiz de ESTE repo para probarlo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig de TreeUI (vacio = autodetectar a7y18/jackpot)"
+        required: false
+        default: ""
+      try_build_bbr:
+        description: "Aplicar bbr-backport.patch y compilar SOLO net/ lib/ (lento, ~15-25 min)"
+        type: boolean
+        default: false
+      toolchain_repo:
+        description: "Repo del toolchain GCC aarch64 (el mismo de la base TreeUI)"
+        required: false
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+
+jobs:
+  diag:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash {0}   # sin -e: un grep vacio no aborta el diagnostico
+
+    steps:
+      # ============================================================
+      # 0. CHECKOUTS
+      # ============================================================
+      - name: Checkout este repo (para bbr-backport.patch)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Checkout kernel de Lineage (referencia, SHA fijo)
+        uses: actions/checkout@v4
+        with:
+          repository: exynos7885-dev/kernel_samsung_exynos7885
+          ref: 6020dfa8315134187f07ca903c9d2ed7ee0256f5
+          path: lineage
+          fetch-depth: 1
+
+      - name: Checkout kernel donante (BFQ + WireGuard)
+        uses: actions/checkout@v4
+        with:
+          repository: prashantpaddune/android_kernel_samsung_a7y18lte
+          ref: 97e4fbcdb31efe88b91cd321dae7bbaece36c51a
+          path: donor
+          fetch-depth: 1
+
+      - name: Checkout fork backup (gobernadores)
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/sack_kernel_samsung_exynos7885_testing
+          ref: 094db06fb7e48e2035263cca7f9fc46a7e0b2490
+          path: forksrc
+          fetch-depth: 1
+          sparse-checkout: drivers/cpufreq
+
+      - name: Checkout AnyKernel3 propio (buscar pistas de SELinux/cmdline)
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/AnyKernel3-a7y18lte
+          token: ${{ secrets.AK3_TOKEN || github.token }}
+          path: ak3
+
+      - name: Dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio lz4 zip \
+            gcc-9 g++-9 device-tree-compiler binutils
+
+      - name: Clonar kernel TreeUI y toolchain
+        run: |
+          git clone --depth=1 -b treeui_treble \
+            https://github.com/VDavid003/universal7885_treeui_kernel kernel
+          git clone --depth=1 "${{ inputs.toolchain_repo }}" tc
+          mkdir -p "$GITHUB_WORKSPACE/diag"
+          cat > "$GITHUB_WORKSPACE/diaglib.sh" <<'EOF'
+          SUM="$GITHUB_WORKSPACE/diag/summary.txt"
+          mkdir -p "$GITHUB_WORKSPACE/diag"
+          rep() { printf '%-6s | %-30s | %s\n' "$1" "$2" "$3" >> "$SUM"; printf '[%s] %s: %s\n' "$1" "$2" "$3"; }
+          export ARCH=arm64 ANDROID_MAJOR_VERSION=q
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-"
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          EOF
+
+      # ============================================================
+      # 1. IDENTIDAD DEL ARBOL + .config RESUELTO
+      # ============================================================
+      - name: 1. Identidad del kernel y defconfig
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          V=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | awk '{print $3}' | head -3 | paste -sd.)
+          rep INFO "Version kernel TreeUI" "$V (commit $(git rev-parse --short HEAD))"
+          LV=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' ../lineage/Makefile | awk '{print $3}' | head -3 | paste -sd.)
+          rep INFO "Version kernel Lineage" "$LV"
+          DV=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' ../donor/Makefile | awk '{print $3}' | head -3 | paste -sd.)
+          rep INFO "Version kernel donante" "$DV"
+          echo "== defconfigs candidatos =="
+          ls arch/arm64/configs | grep -iE '7885|a7y18|jackpot|a8|a7'
+          DEF="${{ inputs.defconfig }}"
+          [ -z "$DEF" ] && DEF=$(ls arch/arm64/configs | grep -iE 'a7y18|jackpot' | head -1)
+          if [ -z "$DEF" ]; then rep FALTA "defconfig" "no autodetectado, indica uno"; exit 1; fi
+          rep INFO "defconfig usado" "$DEF"
+          echo "DEF=$DEF" >> "$GITHUB_ENV"
+          $MK "$DEF" > ../diag/make_defconfig.log 2>&1
+          [ -f .config ] && rep OK ".config generado" "$(wc -l < .config) lineas" || rep FALTA ".config" "make defconfig fallo (ver diag/make_defconfig.log)"
+          # indice de TODOS los simbolos Kconfig del arbol (para chequeos rapidos)
+          grep -rhoE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' --include='Kconfig*' . \
+            | awk '{print $NF}' | sort -u > ../diag/kconfig_symbols.txt
+          echo "simbolos Kconfig indexados: $(wc -l < ../diag/kconfig_symbols.txt)"
+          echo "== Compilador del toolchain =="
+          "${CROSS_COMPILE}gcc" --version | head -1
+          rep INFO "GCC toolchain" "$("${CROSS_COMPILE}gcc" --version | head -1)"
+          echo "== Config de red/tcp por defecto en TreeUI =="
+          grep -E 'CONFIG_DEFAULT_TCP_CONG|CONFIG_TCP_CONG_|CONFIG_NET_SCH_FQ|CONFIG_MPTCP' .config
+
+      # ============================================================
+      # 2. SELINUX (el punto clave: como queda ENFORCING)
+      # ============================================================
+      - name: 2. SELinux - estado en TreeUI vs Lineage vs AnyKernel3
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          echo "===== TreeUI: .config ====="
+          grep -E 'SELINUX|ALWAYS_ENFORCE|DEFEX|PROCA|CONFIG_FIVE|RKP|KNOX|SEC_RESTRICT|CONFIG_CMDLINE' .config
+          echo "===== Lineage: defconfig ====="
+          grep -E 'SELINUX|ENFORC|DEFEX|PROCA|CONFIG_FIVE|CONFIG_CMDLINE' ../lineage/arch/arm64/configs/lineage_a7y18lte_defconfig
+          echo "===== Simbolos Kconfig relacionados (TreeUI) ====="
+          grep -iE 'enforce|selinux' ../diag/kconfig_symbols.txt
+          echo "===== TreeUI: cmdline / bootargs con selinux ====="
+          grep -rn "androidboot.selinux\|selinux=" arch/arm64/boot/dts arch/arm64/configs 2>/dev/null | head -20
+          echo "===== Lineage: cmdline / bootargs con selinux ====="
+          grep -rn "androidboot.selinux\|selinux=" ../lineage/arch/arm64/boot/dts ../lineage/arch/arm64/configs 2>/dev/null | head -20
+          echo "===== TreeUI: codigo que decide enforcing ====="
+          grep -n "selinux_enforcing\|enforcing_setup\|ALWAYS_ENFORCE" security/selinux/hooks.c | head -30
+          grep -rn "selinux_enforcing" include security/selinux/include 2>/dev/null | head -10
+          echo "===== TreeUI: sel_write_enforce (selinuxfs) ====="
+          grep -n -A28 "static ssize_t sel_write_enforce" security/selinux/selinuxfs.c | head -50
+          echo "===== DIFF security/selinux: Lineage vs TreeUI (solo lineas con 'enforc') ====="
+          diff -u ../lineage/security/selinux/hooks.c security/selinux/hooks.c | grep -nE '^[+-].*([Ee]nforc|ENFORC|DEVELOP)' | head -40
+          diff -u ../lineage/security/selinux/selinuxfs.c security/selinux/selinuxfs.c | grep -nE '^[+-].*([Ee]nforc|ENFORC|DEVELOP)' | head -40
+          echo "===== AnyKernel3: pistas (selinux/enforc/cmdline) ====="
+          grep -rniE "selinux|enforc|setenforce|cmdline" ../ak3 -I --exclude-dir=.git 2>/dev/null | head -40
+          echo "===== Veredicto ====="
+          dev=$(grep -c '^CONFIG_SECURITY_SELINUX_DEVELOP=y' .config)
+          always=$(grep -cE '^CONFIG_(ALWAYS_ENFORCE|SECURITY_SELINUX_ALWAYS_ENFORCE)=y' .config)
+          perm=$(grep -rn 'androidboot.selinux=permissive' arch/arm64/boot/dts arch/arm64/configs 2>/dev/null | wc -l)
+          ak=$(grep -rliE 'selinux|setenforce' ../ak3 -I --exclude-dir=.git 2>/dev/null | wc -l)
+          if [ "$always" -gt 0 ]; then
+            rep OK "SELinux kernel" "ALWAYS_ENFORCE=y: el kernel ya fuerza enforcing"
+          elif [ "$dev" -eq 0 ]; then
+            rep OK "SELinux kernel" "SELINUX_DEVELOP=n: enforcing fijo en compilacion"
+          else
+            rep ADAPT "SELinux kernel" "DEVELOP=y y sin ALWAYS_ENFORCE: PUEDE arrancar permissive (cmdline/ramdisk/selinuxfs)"
+          fi
+          [ "$perm" -gt 0 ] && rep ADAPT "SELinux cmdline DTS" "hay $perm bootargs con androidboot.selinux=permissive" || rep OK "SELinux cmdline DTS" "sin permissive en dts/defconfig"
+          rep INFO "AnyKernel3 menciona selinux" "$ak archivo(s) (ver log del paso)"
+          rep INFO "Confirmar en el telefono" "getenforce ; zcat /proc/config.gz | grep SELINUX"
+
+      # ============================================================
+      # 3. RED: BBR / MPTCP / skb->cb / parche
+      # ============================================================
+      - name: 3. Red - compatibilidad de BBR con este arbol
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          grep -q '^CONFIG_MPTCP=y' .config && M=SI || M=NO
+          [ -d net/mptcp ] && MD=SI || MD=NO
+          rep INFO "MPTCP en .config / net/mptcp" "$M / $MD (Lineage lo tiene: el parche BBR asume MPTCP)"
+          echo "--- skb->cb ---";  grep -n "cb\[" include/linux/skbuff.h
+          CB=$(grep -E 'char[[:space:]]+cb\[[0-9]+\]' include/linux/skbuff.h | grep -oE '[0-9]+' | tr '\n' ' ')
+          rep INFO "tamaño skb->cb (todas las ramas)" "$CB (parche BBR lo deja en 72)"
+          echo "--- ICSK_CA_PRIV_SIZE ---"; grep -n "ICSK_CA_PRIV_SIZE\|icsk_ca_priv" include/net/inet_connection_sock.h
+          echo "--- struct tcp_skb_cb ---"; grep -n -A45 "^struct tcp_skb_cb {" include/net/tcp.h | head -80
+          echo "--- ganchos de congestion ---"; grep -n "cong_control\|tso_segs_goal\|sndbuf_expand\|min_tso_segs" include/net/tcp.h
+          echo "--- tcp_sock ---"; grep -n "delivered\|app_limited\|rate_interval\|u32.*lost;\|first_tx_mstamp" include/linux/tcp.h
+          echo "--- sanity de cb en tcp_init ---"; grep -n "sock_skb_cb_check_size\|BUILD_BUG_ON(sizeof(struct tcp_skb_cb)" net/ipv4/tcp.c
+          for f in net/ipv4/tcp_bbr.c net/ipv4/tcp_rate.c lib/win_minmax.c include/linux/win_minmax.h; do
+            [ -f "$f" ] && rep OK "ya existe $f" "BBR parcialmente presente" || rep FALTA "$f" "viene en el parche"
+          done
+          grep -q "cong_control" include/net/tcp.h && rep OK "cong_control en tcp_congestion_ops" "serie 4.6-4.9 presente" || rep FALTA "cong_control" "el parche lo añade"
+          grep -q "BBR" net/ipv4/Kconfig && rep OK "Kconfig BBR" "presente" || rep FALTA "Kconfig BBR" "el parche lo añade"
+          echo "===== Prueba en seco del parche (en un worktree limpio) ====="
+          P="$GITHUB_WORKSPACE/self/bbr-backport.patch"
+          if [ ! -f "$P" ]; then
+            rep INFO "bbr-backport.patch" "no esta en la raiz del repo: subelo para probar el parche"
+          else
+            S=$(sha256sum "$P" | cut -d' ' -f1)
+            [ "$S" = "1e4d69c881547cb9bb322b8fb7682c817b51f7bb4a39ef83269f429bf573192a" ] \
+              && rep OK "sha256 parche BBR" "coincide con el de Lineage" \
+              || rep ADAPT "sha256 parche BBR" "distinto ($S)"
+            git worktree add --detach ../kpatch HEAD > /dev/null 2>&1
+            cd ../kpatch
+            if git apply --check "$P" 2> ../diag/bbr_check.err; then
+              rep OK "BBR apply --check" "el parche aplica LIMPIO en TreeUI"
+            else
+              git apply --reject --whitespace=nowarn "$P" > ../diag/bbr_reject.log 2>&1
+              NREJ=$(find . -name '*.rej' | wc -l)
+              rep ADAPT "BBR apply --check" "NO aplica limpio: $NREJ archivos .rej (ver diag/bbr_reject.log)"
+              echo "--- primeros errores ---"; head -30 ../diag/bbr_check.err
+              echo "--- archivos con rechazos ---"; find . -name '*.rej'
+              mkdir -p ../diag/rej; find . -name '*.rej' -exec sh -c 'cp "$1" ../diag/rej/$(echo "$1" | tr / _)' _ {} \;
+            fi
+            cd ../kernel
+          fi
+
+      # ============================================================
+      # 4. DISPONIBILIDAD DE CADA SIMBOLO DE CONFIG
+      # ============================================================
+      - name: 4. Config - existe y esta activo cada simbolo del kernel de Lineage
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          SYMS="TCP_CONG_ADVANCED TCP_CONG_CUBIC TCP_CONG_BBR TCP_CONG_CDG TCP_CONG_VEGAS TCP_CONG_VENO TCP_CONG_ILLINOIS TCP_CONG_YEAH TCP_CONG_HYBLA TCP_CONG_HSTCP TCP_CONG_SCALABLE TCP_CONG_LP DEFAULT_CUBIC
+          NET_SCH_FQ NET_SCH_FQ_CODEL NET_SCH_CODEL NET_SCH_PIE NET_SCH_SFQ NET_SCH_NETEM NET_SCH_TBF
+          USB_NET_RNDIS_HOST USB_LAN78XX USB_NET_DM9601 USB_NET_SR9700 USB_NET_MCS7830 NET_PKTGEN NET_DROP_MONITOR
+          NETFILTER_XT_TARGET_HL MPTCP CFG80211_DEFAULT_PS
+          KSM UKSM TRANSPARENT_HUGEPAGE TRANSPARENT_HUGEPAGE_MADVISE MEMCG MEMCG_SWAP SCHED_DEBUG
+          ZRAM ZRAM_LZ4_COMPRESS CRYPTO_LZ4 CRYPTO_ZSTD ANDROID_LOW_MEMORY_KILLER
+          CPU_FREQ_GOV_SCHEDUTIL CPU_FREQ_DEFAULT_GOV_SCHEDUTIL FREQVAR_SCHEDTUNE SCHED_TUNE CPU_FREQ_GOV_INTERACTIVE
+          CPU_FREQ_GOV_BLU_ACTIVE CPU_FREQ_GOV_BIOSHOCK CPU_FREQ_GOV_DARKNESS
+          THERMAL_WRITABLE_TRIPS IOSCHED_BFQ IOSCHED_CFQ DEFAULT_BFQ WIREGUARD F2FS_FS INPUT_BOOSTER"
+          printf '%-34s %-10s %s\n' SIMBOLO EN_KCONFIG VALOR_EN_.config | tee ../diag/symbols.txt
+          for s in $SYMS; do
+            grep -qx "$s" ../diag/kconfig_symbols.txt && K=si || K=NO
+            V=$(grep -E "^(CONFIG_${s}=|# CONFIG_${s} is not set)" .config | head -1)
+            [ -z "$V" ] && V="(no aparece)"
+            printf '%-34s %-10s %s\n' "$s" "$K" "$V" | tee -a ../diag/symbols.txt
+            if [ "$K" = "NO" ]; then
+              rep FALTA "CONFIG_$s" "no existe en el Kconfig del arbol: hay que portar codigo"
+            else
+              case "$V" in *"=y"*|*"=m"*) rep OK "CONFIG_$s" "$V" ;; *) rep ADAPT "CONFIG_$s" "existe pero esta apagado: activar en el defconfig" ;; esac
+            fi
+          done
+          echo "== defconfig actual: TCP default y schedulers =="
+          grep -E 'DEFAULT_TCP_CONG|DEFAULT_IOSCHED|CPU_FREQ_DEFAULT_GOV' .config
+
+      # ============================================================
+      # 5. ¿APLICAN LOS FIXES/PARCHES DE FUENTE DE LINEAGE?
+      # ============================================================
+      - name: 5. Fuentes - ¿el codigo que parcheamos en Lineage existe aqui?
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          chk() { # chk <nombre> <archivo> <regex> <msg si presente> <msg si ausente>
+            if [ ! -f "$2" ]; then rep FALTA "$1" "no existe $2"; return; fi
+            if grep -qE "$3" "$2"; then rep ADAPT "$1" "$4"; else rep INFO "$1" "$5"; fi
+          }
+          chk "fix decon_clocks_table" drivers/video/fbdev/exynos/dpu_7885/decon_reg.c '^const double decon_clocks_table' "tiene el bug 'double': aplicar el sed" "sin 'const double' (o ruta distinta): no hace falta"
+          chk "fix topology.c HMP" arch/arm64/kernel/topology.c 'if \(strlen\(CONFIG_HMP_FAST_CPU_MASK\)\) \(strlen' "tiene el bug de sintaxis: aplicar el sed" "no tiene ese bug: no hace falta"
+          chk "fix nl80211 country_code" drivers/net/wireless/scsc/nl80211_vendor.c 'char country_code\[SLSI_COUNTRY_CODE_LEN\];' "variable sin inicializar: aplicar el sed" "ya inicializada o ruta distinta"
+          chk "fix split_huge_page_pmd" fs/proc/task_mmu.c 'split_huge_page_pmd\(vma, pmd, addr\);' "argumentos invertidos: SOLO necesario si activas THP" "sin ese patron: no hace falta"
+          for f in kernel/sched/tune.h kernel/sched/cpufreq_schedutil.c; do
+            [ -f "$f" ] && rep OK "$f" "existe" || rep FALTA "$f" "no existe (schedutil/schedtune ausente)"
+          done
+          grep -q "schedtune_freqvar_boost_init" kernel/sched/tune.h 2>/dev/null && rep INFO "tune.h freqvar" "symbol presente: revisar forward decls si falla compilar"
+          grep -q "arch_scale_freq_invariant" kernel/sched/cpufreq_schedutil.c 2>/dev/null && rep INFO "schedutil freq_invariant" "ya referenciado: revisar si hace falta el #define"
+          echo "--- LMK ---"
+          F=drivers/staging/android/lowmemorykiller.c
+          if [ -f "$F" ]; then
+            grep -n "lowmem_adj\|lowmem_minfree" "$F" | head -20
+            python3 - "$F" <<'PY'
+          import sys
+          s = open(sys.argv[1]).read()
+          old = ("static short lowmem_adj[6] = {\n\t0,\n\t1,\n\t6,\n\t12,\n};\n"
+                 "static int lowmem_adj_size = 4;\n")
+          print("LMK_BLOCK_MATCH=" + ("SI" if old in s else "NO"))
+          PY
+            rep INFO "LMK (kernel)" "driver existe; Android 11 (lmkd) suele sobrescribir minfree: probable que no valga la pena portar"
+          else
+            rep FALTA "LMK" "sin lowmemorykiller.c (usa lmkd/psi): no portar"
+          fi
+          echo "--- Touch IC Imagis IST40XX ---"
+          T=drivers/input/touchscreen/imagis_40xx
+          ls $T 2>/dev/null | head
+          if [ -f $T/ist40xx.c ]; then
+            grep -c "work_reset_check" $T/ist40xx.c $T/ist40xx.h
+            grep -n "ist40xx_scheduled_reset\|IST40XX_HIB_TOUCH_STATUS\|reset_work_func" $T/ist40xx.c | head
+            rep INFO "Touch IST40XX" "driver existe: los 5 anclajes del perl deben re-verificarse"
+          else
+            rep FALTA "Touch IST40XX" "driver en otra ruta: $(find drivers/input/touchscreen -iname 'ist40*' | head -2 | tr '\n' ' ')"
+          fi
+          echo "--- Input booster nativo ---"
+          grep -n "input_booster" drivers/input/input.c | head -5
+          # BFQ / WireGuard presentes en el arbol?
+          ls block/bfq* 2>/dev/null | head -3 && rep OK "BFQ en arbol" "ya existe block/bfq*" || rep FALTA "BFQ en arbol" "portar desde el donante"
+          [ -d net/wireguard ] && rep OK "WireGuard en arbol" "ya existe net/wireguard" || rep FALTA "WireGuard en arbol" "portar desde el donante"
+          ls fs/f2fs 2>/dev/null | head -3
+          # anclas que usa el port de gobernadores
+          [ "$(grep -c '^if X86$' drivers/cpufreq/Kconfig)" = "1" ] && rep OK "Kconfig cpufreq ancla 'if X86'" "1 ocurrencia" || rep ADAPT "Kconfig cpufreq ancla 'if X86'" "ocurrencias != 1: cambiar ancla"
+          for g in blu_active bioshock darkness; do
+            [ -f drivers/cpufreq/cpufreq_$g.c ] && rep OK "gobernador $g" "ya existe en TreeUI" || { [ -f ../forksrc/drivers/cpufreq/cpufreq_$g.c ] && rep INFO "gobernador $g" "no existe, disponible en el fork backup" || rep FALTA "gobernador $g" "no hay fuente"; }
+          done
+
+      # ============================================================
+      # 6. DTS: carga USB, GPU DVFS, input booster, bootargs, dtb
+      # ============================================================
+      - name: 6. DTS - ¿existen los nodos que editamos en Lineage?
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          echo "--- dts del dispositivo ---"
+          find arch/arm64/boot/dts -iname '*a7y18lte*' | sort
+          echo "--- dtb que genera el Makefile ---"
+          grep -rn "a7y18lte" arch/arm64/boot/dts/exynos/Makefile | head
+          F=$(grep -rl "cable_number = <1 4 19 21 22 23 30>;" arch/arm64/boot/dts 2>/dev/null | grep a7y18lte | head -3)
+          [ -n "$F" ] && rep ADAPT "USB fast charge (cable_number)" "grupo encontrado en: $(echo $F | tr '\n' ' ')" || rep FALTA "USB fast charge (cable_number)" "grupo <1 4 19 21 22 23 30> no existe: ver valores reales abajo"
+          echo "--- cable_number real ---"; grep -rn "cable_number" arch/arm64/boot/dts 2>/dev/null | grep a7y18lte | head -20
+          G=$(grep -rl "gpu_dvfs_table_size" arch/arm64/boot/dts 2>/dev/null | grep 7885 | head -3)
+          [ -n "$G" ] && rep ADAPT "GPU DVFS tabla" "encontrada: $(echo $G | tr '\n' ' ')" || rep FALTA "GPU DVFS tabla" "sin gpu_dvfs_table_size para 7885"
+          for f in $G; do grep -nE "gpu_max_clock|1300000|1200000|1100000" "$f" | head -12; done
+          I=$(grep -rl 'input_booster,label = "TOUCH"' arch/arm64/boot/dts 2>/dev/null | head -2)
+          [ -n "$I" ] && rep ADAPT "input_booster TOUCH" "encontrado: $(echo $I | tr '\n' ' ')" || rep FALTA "input_booster TOUCH" "sin nodo en dts"
+          for f in $I; do grep -n "cpu_freqs" "$f" | head -12; done
+          echo "--- capacidad de bateria en el dts (para contrastar con el modulo 3300) ---"
+          grep -rnE 'battery,(full_capacity|capacity)|capacity_max|fuelgauge,capacity' arch/arm64/boot/dts 2>/dev/null | grep -i a7y18 | head -10
+          rep INFO "DTS en el zip" "solo llegan al telefono si incluyes dtb (incluir_dtb=true en la base)"
+
+      # ============================================================
+      # 7. DONANTE
+      # ============================================================
+      - name: 7. Donante - ¿se puede portar BFQ y WireGuard a este arbol?
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          echo "--- BFQ en donante ---"; ls ../donor/block/bfq* ../donor/include/linux/bfq* 2>/dev/null
+          echo "--- WireGuard en donante ---"; find ../donor/net/wireguard -maxdepth 2 | head -40
+          [ -d ../donor/lib/zinc ] && rep INFO "donante lib/zinc" "WireGuard usa zinc: hay que copiarlo tambien"
+          echo "--- dependencias de WireGuard en TreeUI ---"
+          for f in include/net/udp_tunnel.h net/ipv4/udp_tunnel.c net/ipv6/ip6_udp_tunnel.c crypto/chacha20_generic.c crypto/poly1305_generic.c crypto/curve25519-generic.c; do
+            [ -f "$f" ] && echo "OK    $f" || echo "FALTA $f"
+          done
+          grep -qE '^CONFIG_BLK_CGROUP=y' .config && rep INFO "BLK_CGROUP" "activo (bfq-cgroup.c compilable)" || rep INFO "BLK_CGROUP" "apagado"
+          grep -qE '^CONFIG_NET_UDP_TUNNEL|^CONFIG_NET_IP_TUNNEL' .config && rep INFO "UDP/IP tunnel" "$(grep -E '^CONFIG_NET_(UDP|IP)_TUNNEL' .config | tr '\n' ' ')" || rep INFO "UDP/IP tunnel" "no activos: WireGuard los selecciona via Kconfig"
+          D=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' ../donor/Makefile | awk '{print $3}' | head -3 | paste -sd.)
+          T=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | awk '{print $3}' | head -3 | paste -sd.)
+          [ "${D%.*}" = "${T%.*}" ] && rep OK "Rama kernel donante = TreeUI" "$D vs $T (misma rama, port plausible)" || rep ADAPT "Rama kernel donante" "$D vs $T: revisar API"
+
+      # ============================================================
+      # 8. (OPCIONAL) COMPILAR SOLO RED CON EL PARCHE BBR
+      # ============================================================
+      - name: 8. (Opcional) Aplicar parche BBR y compilar net/ y lib/
+        if: ${{ inputs.try_build_bbr }}
+        run: |
+          . "$GITHUB_WORKSPACE/diaglib.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          P="$GITHUB_WORKSPACE/self/bbr-backport.patch"
+          [ -f "$P" ] || { rep INFO "build BBR" "no hay bbr-backport.patch en el repo"; exit 0; }
+          git apply --whitespace=nowarn "$P" || { rep ADAPT "build BBR" "el parche no aplica: no se compila"; exit 0; }
+          sed -i '/^CONFIG_TCP_CONG_BBR/d;/^# CONFIG_TCP_CONG_BBR/d;/^CONFIG_NET_SCH_FQ/d;/^# CONFIG_NET_SCH_FQ/d' .config
+          printf 'CONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\nCONFIG_NET_SCH_FQ=y\n' >> .config
+          $MK olddefconfig > ../diag/bbr_olddef.log 2>&1
+          $MK -j"$(nproc)" prepare scripts > ../diag/bbr_prepare.log 2>&1
+          DIRS="net/core/ net/ipv4/ net/ipv6/ net/sched/ lib/"
+          [ -d net/mptcp ] && DIRS="$DIRS net/mptcp/"
+          $MK -k -j"$(nproc)" $DIRS > ../diag/bbr_build.log 2>&1
+          echo "--- errores ---"; grep -nE 'error:|Error [0-9]+' ../diag/bbr_build.log | head -30
+          NE=$(grep -cE 'error:' ../diag/bbr_build.log)
+          [ -f net/ipv4/tcp_bbr.o ] && rep OK "build tcp_bbr.o" "compilo ($NE errores en el resto)" || rep ADAPT "build tcp_bbr.o" "NO compilo ($NE errores, ver diag/bbr_build.log)"
+          [ -f net/ipv4/tcp_rate.o ] && rep OK "build tcp_rate.o" "compilo" || rep ADAPT "build tcp_rate.o" "NO compilo"
+          [ -f lib/win_minmax.o ] && rep OK "build win_minmax.o" "compilo" || rep ADAPT "build win_minmax.o" "NO compilo"
+
+      # ============================================================
+      # 9. RESUMEN + ARTEFACTOS
+      # ============================================================
+      - name: 9. Resumen
+        if: always()
+        run: |
+          S="$GITHUB_WORKSPACE/diag/summary.txt"
+          {
+            echo "## Diagnostico TreeUI -> portar mejoras de Lineage"
+            echo "OK = listo | ADAPT = adaptar | FALTA = no existe | INFO = dato"
+            echo '```'
+            sort -s -t'|' -k1,1 "$S" 2>/dev/null | awk '{print}' 
+            echo '```'
+            echo "Conteo: OK=$(grep -c '^OK' "$S") ADAPT=$(grep -c '^ADAPT' "$S") FALTA=$(grep -c '^FALTA' "$S")"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          cp "$GITHUB_WORKSPACE/kernel/.config" "$GITHUB_WORKSPACE/diag/treeui.config" 2>/dev/null || true
+
+      - name: Subir diagnostico
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-diag
+          path: diag/

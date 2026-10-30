@@ -350,7 +350,27 @@ jobs:
         run: |
           cd kernel
           MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
-          $MK "$DEF" > ../report/make_defconfig.log 2>&1 || { tail -30 ../report/make_defconfig.log; exit 1; }
+          $MK "$DEF" > ../report/make_defconfig.log 2>&1 || {
+            tail -30 ../report/make_defconfig.log
+            {
+              echo "=== DIAGNOSTICO make defconfig ==="
+              echo "--- net/Kconfig lineas 75-95 ---"; sed -n 75,95p net/Kconfig
+              echo "--- net/wireguard ---"; ls -la net/wireguard 2>&1 | head
+              echo "--- git: archivos de net/wireguard y net/Kconfig en el commit ---"
+              git ls-files net/wireguard | head -5; git log -1 --format='%h %s' -- net/Kconfig
+              echo "--- git status (solo modificados/borrados) ---"
+              git status --short | grep -v '^??' | head -40
+              echo "--- archivos borrados respecto a HEAD ---"
+              git ls-files --deleted | head -20
+              echo "--- quien llama a tar/xz en los Makefile ---"
+              grep -nE 'tar |xz|\.tar' Makefile arch/arm64/Makefile scripts/Kbuild.include net/Makefile 2>/dev/null | head -20
+              echo "--- archivos .xz / .tar en el arbol ---"
+              find . -path ./.git -prune -o \( -name '*.xz' -o -name '*.tar*' \) -print | head -20
+              echo "--- ubicacion del warning xz: lineas de make que lo producen ---"
+              make -n HOSTCC=gcc-9 "$DEF" 2>&1 | grep -n 'tar\|xz' | head
+            } 2>&1 | tee ../report/diag_make_fail.txt
+            exit 1
+          }
           R=../report/net-status.txt
           : > "$R"
           ok=0; tot=0

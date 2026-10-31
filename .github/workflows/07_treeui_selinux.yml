@@ -1,0 +1,681 @@
+name: 07_treeui_selinux
+
+# ETAPA B2 (acumulativa sobre la B1 que ya arranca): BFQ + gobernadores extra + fix nl80211.
+#   Base: config de red (Etapa A) + BBR (Etapa B1), igual que el zip que funciona.
+#   - BFQ: se porta desde el donante (4.4.218, misma rama) y queda DISPONIBLE.
+#     El scheduler por defecto sigue siendo cfq salvo que marques bfq_default=true.
+#   - Gobernadores blu_active / bioshock / darkness: se compilan y quedan disponibles;
+#     el gobernador por defecto NO cambia.
+#   - nl80211 country_code: inicializa el buffer (fix de Lineage).
+#   Cada bloque tiene su propio interruptor para aislar un fallo de compilacion.
+#   ETAPA C (SELinux): el defconfig de TreeUI trae CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=y
+#   (commit 'Never enforce'), que fuerza permissive y hace que `setenforce 1` se ignore.
+#   Esta etapa lo quita. Se compila SIN O=out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig (vacio = autodetectar a7y18lte)"
+        required: false
+        default: ""
+      bfq:
+        description: "Portar BFQ (queda disponible; default sigue cfq)"
+        type: boolean
+        default: true
+      bfq_default:
+        description: "Dejar BFQ como scheduler de IO por defecto (false = cfq, BFQ se elige a mano)"
+        type: boolean
+        default: false
+      gov_extra:
+        description: "Portar gobernadores blu_active, bioshock, darkness (disponibles, sin cambiar el default)"
+        type: boolean
+        default: true
+      nl80211_fix:
+        description: "Fix nl80211 country_code (buffer inicializado)"
+        type: boolean
+        default: true
+      bbr_default:
+        description: "Dejar BBR como TCP por defecto (false = cubic por defecto, BBR se activa a mano)"
+        type: boolean
+        default: false
+      incluir_dtb:
+        description: "Incluir dtb.img en el zip (esta etapa no toca DTS: deja false)"
+        type: boolean
+        default: false
+      selinux_modo:
+        description: "quitar_never = solo quita NEVER_ENFORCE (setenforce funciona; init pone enforcing al arrancar). always = ALWAYS_ENFORCE (no se puede volver a permissive sin reflashear)"
+        type: choice
+        options:
+          - quitar_never
+          - always
+        default: quitar_never
+      cmdline_permissive:
+        description: "Anadir androidboot.selinux=permissive al cmdline (red de seguridad: solo la respeta el init si el ROM es debuggable; no esta verificado)"
+        type: boolean
+        default: false
+      toolchain_repo:
+        description: "Repo del toolchain GCC aarch64"
+        required: false
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      ARCH: arm64
+      ANDROID_MAJOR_VERSION: q
+      CROSS_COMPILE: ${{ github.workspace }}/tc/bin/aarch64-linux-android-
+    steps:
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zip \
+            gcc-9 g++-9 device-tree-compiler binutils
+
+      - name: Clonar kernel TreeUI (sin historial)
+        run: |
+          git clone --depth=1 -b treeui_treble \
+            https://github.com/VDavid003/universal7885_treeui_kernel kernel
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+          git -C kernel log -1 --format='commit %h %s'
+
+      - name: Clonar toolchain
+        run: |
+          git clone --depth=1 "${{ inputs.toolchain_repo }}" tc
+          "$CROSS_COMPILE"gcc --version | head -1
+
+      - name: Elegir defconfig
+        id: cfg
+        run: |
+          cd kernel/arch/arm64/configs
+          DEF="${{ inputs.defconfig }}"
+          if [ -z "$DEF" ]; then
+            DEF=$(ls | grep -iE 'a7y18' | head -1 || true)
+          fi
+          if [ -z "$DEF" ] || [ ! -f "$DEF" ]; then
+            echo "No se autodetecto defconfig. Reejecuta indicando uno de:" >&2
+            ls | grep -iE '7885|a7y18|jackpot' >&2
+            exit 1
+          fi
+          echo "Usando: $DEF"
+          echo "def=$DEF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout este repo (bbr-backport.patch)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Etapa B1 - aplicar bbr-backport.patch
+        run: |
+          set -u
+          P="$GITHUB_WORKSPACE/self/bbr-backport.patch"
+          mkdir -p report
+          [ -f "$P" ] || { echo "ERROR: falta bbr-backport.patch en la raiz del repo"; exit 1; }
+          sha256sum "$P" | tee report/patch.sha256
+          cd kernel
+          if git apply --check "$P" 2> ../report/bbr_check.err; then
+            echo "Metodo: git apply (limpio, sin fuzz)"
+            git apply --whitespace=nowarn "$P"
+            echo "metodo=git apply limpio" > ../report/bbr_method.txt
+          else
+            echo "git apply estricto NO aplica; primeros errores:"; head -30 ../report/bbr_check.err
+            echo "--- patch -F3: aplica lo que entra y reporta los hunks que no ---"
+            patch -p1 -F3 --no-backup-if-mismatch < "$P" > ../report/bbr_apply.log 2>&1 || true
+            grep -E 'FAILED|fuzz' ../report/bbr_apply.log | head -20 || true
+            REJ=$(find . -name '*.rej' | sort | tr '\n' ' ')
+            echo "Archivos con rechazos: ${REJ:-ninguno}"
+            # Solo se toleran los 2 rechazos YA CONOCIDOS (4.4.185 difiere de 4.4.302 en esas 2 lineas)
+            for r in $REJ; do
+              case "$r" in
+                ./include/linux/tcp.h.rej|./lib/Makefile.rej) ;;
+                *) echo "ERROR: rechazo inesperado: $r"; cat "$r" | head -40; exit 1;;
+              esac
+            done
+            # --- correccion manual 1: lib/Makefile (win_minmax.o) ---
+            if [ -f lib/Makefile.rej ]; then
+              grep -q 'win_minmax.o' lib/Makefile || printf '\nlib-y += win_minmax.o\n' >> lib/Makefile
+              rm -f lib/Makefile.rej
+              grep -n 'win_minmax' lib/Makefile || { echo "ERROR: lib/Makefile sin win_minmax"; exit 1; }
+            fi
+            # --- correccion manual 2: include/linux/tcp.h (bit rate_app_limited) ---
+            if [ -f include/linux/tcp.h.rej ]; then
+              grep -q 'rate_app_limited' include/linux/tcp.h || \
+                sed -i '/^[[:space:]]*u32[[:space:]]*rate_interval_us;/a\\tu8\trate_app_limited:1;  /* rate_{delivered,interval_us} limited? */' include/linux/tcp.h
+              rm -f include/linux/tcp.h.rej
+              grep -n 'rate_interval_us\|rate_app_limited' include/linux/tcp.h || { echo "ERROR: tcp.h sin rate_app_limited"; exit 1; }
+              [ "$(grep -c 'rate_app_limited' include/linux/tcp.h)" = 1 ] || { echo "ERROR: rate_app_limited duplicado o ausente"; exit 1; }
+            fi
+            echo "metodo=patch -F3 + 2 correcciones manuales (tcp.h bit, lib/Makefile)" > ../report/bbr_method.txt
+          fi
+          echo "=== verificaciones post-parche ==="
+          find . -name '*.rej' -o -name '*.orig' | head && true
+          [ -z "$(find . -name '*.rej')" ] || { echo "ERROR: quedaron .rej"; exit 1; }
+          for f in net/ipv4/tcp_bbr.c net/ipv4/tcp_rate.c lib/win_minmax.c include/linux/win_minmax.h; do
+            [ -f "$f" ] && echo "OK  $f" || { echo "ERROR: falta $f"; exit 1; }
+          done
+          grep -n 'char[[:space:]]*cb\[72\]' include/linux/skbuff.h || { echo "ERROR: skb->cb no quedo en 72"; exit 1; }
+          grep -n 'ICSK_CA_PRIV_SIZE' include/net/inet_connection_sock.h | head -3
+          grep -n 'TCP_CONG_BBR' net/ipv4/Kconfig net/ipv4/Makefile
+          grep -n 'win_minmax' lib/Makefile
+          git status --short | head -30
+
+      - name: Checkout kernel donante (BFQ)
+        if: ${{ inputs.bfq }}
+        uses: actions/checkout@v4
+        with:
+          repository: prashantpaddune/android_kernel_samsung_a7y18lte
+          ref: 97e4fbcdb31efe88b91cd321dae7bbaece36c51a
+          path: donor
+          fetch-depth: 1
+
+      - name: Checkout fork backup (gobernadores)
+        if: ${{ inputs.gov_extra }}
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/sack_kernel_samsung_exynos7885_testing
+          ref: 094db06fb7e48e2035263cca7f9fc46a7e0b2490
+          path: forksrc
+          fetch-depth: 1
+          sparse-checkout: drivers/cpufreq
+
+      - name: Etapa B2 - fix nl80211 country_code
+        if: ${{ inputs.nl80211_fix }}
+        run: |
+          cd kernel
+          F=drivers/net/wireless/scsc/nl80211_vendor.c
+          PAT='char country_code\[SLSI_COUNTRY_CODE_LEN\];'
+          n=$(grep -c "$PAT" "$F" || true)
+          [ "$n" -ge 1 ] || { echo "ERROR: patron no encontrado en $F"; grep -n country_code "$F" | head; exit 1; }
+          sed -i 's/char country_code\[SLSI_COUNTRY_CODE_LEN\];/char country_code[SLSI_COUNTRY_CODE_LEN] = {0};/' "$F"
+          grep -n 'char country_code\[SLSI_COUNTRY_CODE_LEN\]' "$F"
+          [ "$(grep -c 'char country_code\[SLSI_COUNTRY_CODE_LEN\] = {0};' "$F")" = "$n" ] || { echo "ERROR: el sed no cambio todas las ocurrencias"; exit 1; }
+          echo "OK: nl80211 ($n ocurrencias)"
+
+      - name: Etapa B2 - portar BFQ (codigo + Kconfig + Makefile)
+        if: ${{ inputs.bfq }}
+        run: |
+          cd kernel
+          for f in bfq-iosched.c bfq-cgroup.c bfq-ioc.c bfq-sched.c bfq.h; do
+            [ -f "../donor/block/$f" ] || { echo "ERROR: falta donor/block/$f"; ls ../donor/block | grep -i bfq; exit 1; }
+            cp -v "../donor/block/$f" block/
+          done
+          echo "--- includes textuales de bfq-iosched.c ---"
+          grep -n '#include "bfq' block/bfq-iosched.c || true
+          python3 - <<'PYEOF'
+          import sys
+          p = "block/Kconfig.iosched"
+          s = open(p).read()
+          def die(m):
+              print("ERROR:", m); print(s); sys.exit(1)
+          if "IOSCHED_BFQ" in s: die("Kconfig.iosched ya contiene BFQ")
+          cfg = ("config IOSCHED_BFQ\n\ttristate \"BFQ I/O scheduler\"\n\tdefault n\n\t---help---\n"
+                 "\t  BFQ (Budget Fair Queueing) is a proportional-share I/O scheduler\n"
+                 "\t  with low latency and fairness.\n\n")
+          if s.count("\nendchoice\n") != 1: die("ancla endchoice no unica")
+          if s.count('\tdefault "noop" if DEFAULT_NOOP\n') != 1: die('ancla default "noop" no unica')
+          if s.count("\nendmenu") != 1: die("ancla endmenu no unica")
+          s = s.replace("\nendmenu", "\n" + cfg + "endmenu", 1)
+          s = s.replace("\nendchoice\n", '\nconfig DEFAULT_BFQ\n\tbool "BFQ" if IOSCHED_BFQ=y\n\nendchoice\n', 1)
+          s = s.replace('\tdefault "noop" if DEFAULT_NOOP\n', '\tdefault "noop" if DEFAULT_NOOP\n\tdefault "bfq" if DEFAULT_BFQ\n', 1)
+          open(p, "w").write(s)
+          m = open("block/Makefile").read()
+          if "bfq" in m: print("ERROR: block/Makefile ya menciona bfq"); sys.exit(1)
+          if not m.endswith("\n"): m += "\n"
+          m += "obj-$(CONFIG_IOSCHED_BFQ)\t+= bfq-iosched.o\n"
+          open("block/Makefile", "w").write(m)
+          print("OK: Kconfig.iosched y Makefile")
+          PYEOF
+          grep -n 'BFQ\|bfq' block/Kconfig.iosched block/Makefile
+
+      - name: Etapa B2 - portar gobernadores extra
+        if: ${{ inputs.gov_extra }}
+        run: |
+          cd kernel
+          for g in blu_active bioshock darkness; do
+            [ -f "../forksrc/drivers/cpufreq/cpufreq_$g.c" ] || { echo "ERROR: falta cpufreq_$g.c en el respaldo"; exit 1; }
+            cp -v "../forksrc/drivers/cpufreq/cpufreq_$g.c" drivers/cpufreq/
+          done
+          python3 - <<'PYEOF'
+          import sys
+          kc, mk = "drivers/cpufreq/Kconfig", "drivers/cpufreq/Makefile"
+          entries = (
+              "config CPU_FREQ_GOV_BLU_ACTIVE\n\ttristate \"'blu_active' cpufreq policy governor\"\n\tdepends on CPU_FREQ\n\thelp\n\t  'blu_active' is a dynamic governor for latency-sensitive workloads.\n\n"
+              "config CPU_FREQ_GOV_BIOSHOCK\n\ttristate \"'bioshock' cpufreq governor\"\n\tdepends on CPU_FREQ\n\thelp\n\t  'bioshock' is an aggressive variant of the conservative governor.\n\n"
+              "config CPU_FREQ_GOV_DARKNESS\n\ttristate \"'darkness' cpufreq policy governor\"\n\tdepends on CPU_FREQ\n\n")
+          k = open(kc).read()
+          if "CPU_FREQ_GOV_BLU_ACTIVE" in k: sys.exit("ERROR: Kconfig ya contiene los gobernadores")
+          anchor = "\nif X86\n"
+          if k.count(anchor) != 1: sys.exit("ERROR: ancla 'if X86' no aparece exactamente una vez")
+          open(kc, "w").write(k.replace(anchor, "\n" + entries + "if X86\n", 1))
+          m = open(mk).read()
+          if "blu_active" in m: sys.exit("ERROR: Makefile ya contiene blu_active")
+          if not m.endswith("\n"): m += "\n"
+          for n, c in (("blu_active","BLU_ACTIVE"),("darkness","DARKNESS"),("bioshock","BIOSHOCK")):
+              m += "obj-$(CONFIG_CPU_FREQ_GOV_%s)\t+= cpufreq_%s.o\n" % (c, n)
+          open(mk, "w").write(m)
+          print("OK: Kconfig y Makefile de cpufreq")
+          PYEOF
+          grep -n 'BLU_ACTIVE\|BIOSHOCK\|DARKNESS' drivers/cpufreq/Kconfig drivers/cpufreq/Makefile
+
+      # ============================================================
+      # ETAPA A (acumulada): aplicar config de red
+      # ============================================================
+      - name: Etapa A - aplicar config de red al defconfig
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+          TCP_EXTRA: true
+          QDISC_EXTRA: true
+          TTL_HL: true
+          USB_ETH: true
+          NET_DIAG: true
+          WIFI_PS_OFF: false
+        run: |
+          cd kernel
+          CFG="arch/arm64/configs/$DEF"
+          mkdir -p "$GITHUB_WORKSPACE/report"
+          cp "$CFG" "$GITHUB_WORKSPACE/report/defconfig.orig"
+
+          # indice de simbolos Kconfig (para saltar los que no existen en este arbol)
+          grep -rhoE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' --include='Kconfig*' . \
+            | awk '{print $NF}' | sort -u > "$GITHUB_WORKSPACE/report/kconfig_symbols.txt"
+          has_sym() { grep -qx "$1" "$GITHUB_WORKSPACE/report/kconfig_symbols.txt"; }
+
+          set_y() {
+            sed -i "/^# CONFIG_$1 is not set/d;/^CONFIG_$1=/d" "$CFG"
+            echo "CONFIG_$1=y" >> "$CFG"
+          }
+
+          echo "=== ANTES: lineas de la choice TCP en el defconfig ==="
+          grep -nE 'CONFIG_(DEFAULT_(BIC|CUBIC|HTCP|HYBLA|VEGAS|VENO|WESTWOOD|DCTCP|CDG|BBR|RENO)|DEFAULT_TCP_CONG|TCP_CONG_ADVANCED|TCP_CONG_CUBIC)' "$CFG" || echo "(ninguna)"
+
+          # ---- cubic como default (la choice solo admite UNA seleccion) ----
+          sed -i -E '/^(# )?CONFIG_DEFAULT_(BIC|CUBIC|HTCP|HYBLA|VEGAS|VENO|WESTWOOD|DCTCP|CDG|BBR|RENO)[ =]/d;/^CONFIG_DEFAULT_TCP_CONG=/d' "$CFG"
+          set_y TCP_CONG_ADVANCED
+          set_y TCP_CONG_CUBIC
+          echo "CONFIG_DEFAULT_CUBIC=y" >> "$CFG"
+          if [ "${{ inputs.bbr_default }}" = "true" ]; then
+            sed -i '/^CONFIG_DEFAULT_CUBIC=y/d' "$CFG"
+            # TCP_CONG_BBR=y debe ir ANTES de DEFAULT_BBR: la opcion de la choice solo es
+            # visible si TCP_CONG_BBR=y ya se leyo (si no, kconfig la descarta y no queda ninguna)
+            set_y TCP_CONG_BBR
+            echo "CONFIG_DEFAULT_BBR=y" >> "$CFG"
+          fi
+
+          OPTS="TCP_CONG_BBR"
+          [ "$TCP_EXTRA" = "true" ]   && OPTS="$OPTS TCP_CONG_CDG TCP_CONG_VEGAS TCP_CONG_VENO TCP_CONG_ILLINOIS TCP_CONG_YEAH TCP_CONG_HYBLA TCP_CONG_HSTCP TCP_CONG_SCALABLE TCP_CONG_LP"
+          [ "$QDISC_EXTRA" = "true" ] && OPTS="$OPTS NET_SCH_FQ NET_SCH_FQ_CODEL NET_SCH_CODEL NET_SCH_PIE NET_SCH_SFQ NET_SCH_NETEM NET_SCH_TBF"
+          [ "$TTL_HL" = "true" ]      && OPTS="$OPTS NETFILTER_XT_TARGET_HL"
+          [ "$NET_DIAG" = "true" ]    && OPTS="$OPTS NET_PKTGEN NET_DROP_MONITOR"
+          if [ "$USB_ETH" = "true" ]; then
+            # los drivers USB ethernet dependen de USB_USBNET
+            for dep in USB_NET_DRIVERS USB_USBNET; do has_sym "$dep" && set_y "$dep"; done
+            OPTS="$OPTS USB_NET_RNDIS_HOST USB_LAN78XX USB_NET_DM9601 USB_NET_SR9700 USB_NET_MCS7830"
+          fi
+          echo "$OPTS" | xargs -n1 > "$GITHUB_WORKSPACE/report/opts.txt"
+
+          : > "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"
+          for o in $OPTS; do
+            if has_sym "$o"; then grep -q "^CONFIG_$o=y" "$CFG" || set_y "$o"; else echo "$o" >> "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; fi
+          done
+          [ -s "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt" ] && { echo "AVISO - simbolos sin Kconfig en este arbol (omitidos):"; cat "$GITHUB_WORKSPACE/report/skipped_no_kconfig.txt"; }
+
+          if [ "$WIFI_PS_OFF" = "true" ]; then
+            sed -i 's/^CONFIG_CFG80211_DEFAULT_PS=y/# CONFIG_CFG80211_DEFAULT_PS is not set/' "$CFG"
+            echo "WIFI_PS=desactivado (input wifi_ps_off=true)" >> "$GITHUB_ENV"
+          else
+            echo "WIFI_PS=por defecto del kernel (sin cambios)" >> "$GITHUB_ENV"
+          fi
+
+          echo "=== DIFF del defconfig (lo unico que cambia esta etapa) ==="
+          diff "$GITHUB_WORKSPACE/report/defconfig.orig" "$CFG" || true
+
+      - name: Etapa B2 - config de BFQ y gobernadores en el defconfig
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+          BFQ: ${{ inputs.bfq }}
+          BFQ_DEFAULT: ${{ inputs.bfq_default }}
+          GOV: ${{ inputs.gov_extra }}
+        run: |
+          cd kernel
+          CFG="arch/arm64/configs/$DEF"
+          if [ "$BFQ" = "true" ]; then
+            sed -i '/CONFIG_IOSCHED_BFQ[= ]/d' "$CFG"
+            echo "CONFIG_IOSCHED_BFQ=y" >> "$CFG"
+            if [ "$BFQ_DEFAULT" = "true" ]; then
+              # IOSCHED_BFQ=y ya esta escrito ANTES de DEFAULT_BFQ (orden importa en la choice)
+              sed -i '/^CONFIG_DEFAULT_\(DEADLINE\|CFQ\|NOOP\|BFQ\)=/d;/^# CONFIG_DEFAULT_\(DEADLINE\|CFQ\|NOOP\|BFQ\) is not set/d;/^CONFIG_DEFAULT_IOSCHED=/d' "$CFG"
+              echo "CONFIG_DEFAULT_BFQ=y" >> "$CFG"
+            fi
+          fi
+          if [ "$GOV" = "true" ]; then
+            for g in BLU_ACTIVE BIOSHOCK DARKNESS; do
+              sed -i "/CONFIG_CPU_FREQ_GOV_$g[= ]/d" "$CFG"
+              echo "CONFIG_CPU_FREQ_GOV_$g=y" >> "$CFG"
+            done
+          fi
+          grep -nE 'IOSCHED_BFQ|DEFAULT_BFQ|DEFAULT_CFQ|DEFAULT_IOSCHED|GOV_(BLU_ACTIVE|BIOSHOCK|DARKNESS)' "$CFG" || true
+
+      - name: Etapa C - SELinux en el defconfig (quitar NEVER_ENFORCE)
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+          MODO: ${{ inputs.selinux_modo }}
+        run: |
+          cd kernel
+          CFG="arch/arm64/configs/$DEF"
+          cp "$CFG" "$GITHUB_WORKSPACE/report/defconfig.pre_selinux"
+          echo "=== ANTES ==="
+          grep -nE 'SELINUX_(DEVELOP|NEVER_ENFORCE|ALWAYS_ENFORCE|FAKE_ENFORCE)|CONFIG_SECURITY_SELINUX=' "$CFG" || true
+          grep -q '^CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=y' "$CFG" || { echo "ERROR: NEVER_ENFORCE no estaba activo en el defconfig (cambio el arbol?)"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' "$CFG" || { echo "ERROR: SELINUX_DEVELOP no esta activo"; exit 1; }
+          sed -i '/CONFIG_SECURITY_SELINUX_NEVER_ENFORCE[= ]/d;/CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE[= ]/d;/CONFIG_SECURITY_SELINUX_FAKE_ENFORCE[= ]/d' "$CFG"
+          echo "# CONFIG_SECURITY_SELINUX_NEVER_ENFORCE is not set" >> "$CFG"
+          echo "# CONFIG_SECURITY_SELINUX_FAKE_ENFORCE is not set" >> "$CFG"
+          if [ "$MODO" = "always" ]; then
+            echo "CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=y" >> "$CFG"
+          else
+            echo "# CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE is not set" >> "$CFG"
+          fi
+          echo "=== DESPUES ==="
+          grep -nE 'SELINUX_(DEVELOP|NEVER_ENFORCE|ALWAYS_ENFORCE|FAKE_ENFORCE)' "$CFG"
+          echo "=== DIFF del defconfig en este paso ==="
+          diff "$GITHUB_WORKSPACE/report/defconfig.pre_selinux" "$CFG" || true
+
+      - name: Etapa A - resolver .config y verificar cada simbolo
+        env:
+          DEF: ${{ steps.cfg.outputs.def }}
+        run: |
+          cd kernel
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          $MK "$DEF" > ../report/make_defconfig.log 2>&1 || {
+            tail -30 ../report/make_defconfig.log
+            {
+              echo "=== DIAGNOSTICO make defconfig ==="
+              echo "--- net/Kconfig lineas 75-95 ---"; sed -n 75,95p net/Kconfig
+              echo "--- net/wireguard ---"; ls -la net/wireguard 2>&1 | head
+              echo "--- git: archivos de net/wireguard y net/Kconfig en el commit ---"
+              git ls-files net/wireguard | head -5; git log -1 --format='%h %s' -- net/Kconfig
+              echo "--- git status (solo modificados/borrados) ---"
+              git status --short | grep -v '^??' | head -40
+              echo "--- archivos borrados respecto a HEAD ---"
+              git ls-files --deleted | head -20
+              echo "--- quien llama a tar/xz en los Makefile ---"
+              grep -nE 'tar |xz|\.tar' Makefile arch/arm64/Makefile scripts/Kbuild.include net/Makefile 2>/dev/null | head -20
+              echo "--- archivos .xz / .tar en el arbol ---"
+              find . -path ./.git -prune -o \( -name '*.xz' -o -name '*.tar*' \) -print | head -20
+              echo "--- ubicacion del warning xz: lineas de make que lo producen ---"
+              make -n HOSTCC=gcc-9 "$DEF" 2>&1 | grep -n 'tar\|xz' | head
+            } 2>&1 | tee ../report/diag_make_fail.txt
+            exit 1
+          }
+          R=../report/net-status.txt
+          : > "$R"
+          ok=0; tot=0
+          for o in $(cat ../report/opts.txt); do
+            tot=$((tot+1))
+            if grep -q "^CONFIG_$o=y" .config; then ok=$((ok+1)); echo "OK  $o" >> "$R"
+            elif grep -qx "$o" ../report/skipped_no_kconfig.txt; then echo "NO  $o (no existe en el Kconfig de este arbol)" >> "$R"
+            else echo "NO  $o (no resolvio: dependencia sin cumplir)" >> "$R"; fi
+          done
+          cat "$R"
+          echo "Resueltas: $ok de $tot"
+          echo "NET_SUMMARY=$ok de $tot activas" >> "$GITHUB_ENV"
+
+          echo "=== CRITICOS (si fallan, aborta) ==="
+          grep -q "^CONFIG_TCP_CONG_CUBIC=y" .config || { echo "ERROR: cubic no esta compilado"; exit 1; }
+          grep -q "^CONFIG_TCP_CONG_BBR=y" .config || { echo "ERROR: BBR no quedo activo"; grep -n "TCP_CONG" .config | head -20; exit 1; }
+          if [ "${{ inputs.bbr_default }}" = "true" ]; then WANT=bbr; else WANT=cubic; fi
+          grep -q "^CONFIG_DEFAULT_TCP_CONG=\"$WANT\"" .config || { echo "ERROR: TCP por defecto NO es $WANT"; grep -n "DEFAULT_TCP_CONG\|CONFIG_DEFAULT_" .config | head; exit 1; }
+          if [ "true" = "true" ]; then
+            grep -q "^CONFIG_NET_SCH_FQ=y" .config || { echo "ERROR: fq no quedo activo"; grep -n "NET_SCHED\|NET_SCH_FQ" .config; exit 1; }
+          fi
+          grep -E 'DEFAULT_TCP_CONG|^CONFIG_NET_SCHED=|CONFIG_MPTCP=|CONFIG_USB_USBNET' .config
+
+          echo "=== INFO: prerrequisitos de TTL/HL (iptables necesita las tablas mangle) ==="
+          grep -E 'CONFIG_(IP_NF_MANGLE|IP6_NF_MANGLE|NETFILTER_XT_TARGET_HL|NETFILTER_XT_MATCH_HL|IP_NF_TARGET_TTL|NETFILTER_ADVANCED)=' .config || echo "(ninguno resuelto)"
+          echo "=== INFO: Wi-Fi PS ==="
+          grep -n "CFG80211_DEFAULT_PS" .config || true
+
+      - name: Etapa B2 - verificar .config resuelto
+        env:
+          BFQ: ${{ inputs.bfq }}
+          BFQ_DEFAULT: ${{ inputs.bfq_default }}
+          GOV: ${{ inputs.gov_extra }}
+        run: |
+          cd kernel
+          R=../report/b2-status.txt; : > "$R"
+          ok() { echo "OK  $1" >> "$R"; }
+          bad() { echo "FALLA  $1" >> "$R"; }
+          if [ "$BFQ" = "true" ]; then
+            grep -q '^CONFIG_IOSCHED_BFQ=y' .config && ok "IOSCHED_BFQ=y" || bad "IOSCHED_BFQ no resolvio"
+            if [ "$BFQ_DEFAULT" = "true" ]; then WANT=bfq; else WANT=cfq; fi
+            grep -q "^CONFIG_DEFAULT_IOSCHED=\"$WANT\"" .config && ok "scheduler por defecto = $WANT" || { bad "scheduler por defecto NO es $WANT"; grep -n 'DEFAULT_IOSCHED\|CONFIG_DEFAULT_.*=y' .config >> "$R"; }
+          fi
+          if [ "$GOV" = "true" ]; then
+            for g in BLU_ACTIVE BIOSHOCK DARKNESS; do
+              grep -q "^CONFIG_CPU_FREQ_GOV_$g=y" .config && ok "GOV_$g=y" || bad "GOV_$g no resolvio"
+            done
+          fi
+          # el gobernador por defecto no debe cambiar
+          grep -E '^CONFIG_CPU_FREQ_DEFAULT_GOV' .config | sed 's/^/INFO  /' >> "$R" || true
+          cat "$R"
+          if grep -q '^FALLA' "$R"; then echo "ERROR: config B2 no resolvio"; exit 1; fi
+
+      - name: Etapa C - verificar SELinux en el .config resuelto
+        env:
+          MODO: ${{ inputs.selinux_modo }}
+        run: |
+          cd kernel
+          grep -nE 'CONFIG_SECURITY_SELINUX(_DEVELOP|_NEVER_ENFORCE|_ALWAYS_ENFORCE|_FAKE_ENFORCE|_BOOTPARAM_VALUE)?[= ]|CONFIG_AUDIT[= ]|CONFIG_SEC_AVC_LOG' .config | tee ../report/selinux-config.txt
+          grep -q '^CONFIG_SECURITY_SELINUX=y' .config || { echo "ERROR: SELinux no quedo activo"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y' .config || { echo "ERROR: DEVELOP no quedo activo"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX_NEVER_ENFORCE=y' .config && { echo "ERROR: NEVER_ENFORCE sigue activo"; exit 1; }
+          grep -q '^CONFIG_SECURITY_SELINUX_FAKE_ENFORCE=y' .config && { echo "ERROR: FAKE_ENFORCE activo"; exit 1; }
+          if [ "$MODO" = "always" ]; then
+            grep -q '^CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=y' .config || { echo "ERROR: ALWAYS_ENFORCE no quedo activo"; exit 1; }
+          else
+            grep -q '^CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE=y' .config && { echo "ERROR: ALWAYS_ENFORCE activo en modo quitar_never"; exit 1; }
+          fi
+          echo "OK: SELinux modo=$MODO"
+
+      # ============================================================
+      # COMPILACION (en el arbol, sin O=out)
+      # ============================================================
+      - name: Compilar
+        run: |
+          cd kernel
+          MK="make HOSTCC=gcc-9 HOSTCXX=g++-9 KCFLAGS=-Wno-error"
+          if ! $MK -j"$(nproc)" > ../build.log 2>&1; then
+            echo "=== PRIMEROS ERRORES (build.log) ==="
+            grep -nE 'error:|Error [0-9]+|\*\*\*|undefined reference|No such file' ../build.log | head -n 30
+            echo "=== Reintento en serie para aislar el primer error ==="
+            $MK -j1 > ../build_serial.log 2>&1 || true
+            grep -nE -m1 -B8 -A4 'error:|\*\*\*' ../build_serial.log || tail -n 40 ../build_serial.log
+            exit 1
+          fi
+          ls -la arch/arm64/boot/
+          [ -f arch/arm64/boot/Image ] || { echo "ERROR: Image no generado"; exit 1; }
+
+      - name: Verificar que los objetos se compilaron de verdad
+        run: |
+          cd kernel
+          R=../report/obj-status.txt
+          : > "$R"
+          chk() { # chk <CONFIG sin prefijo> <ruta .o>
+            grep -q "^CONFIG_$1=y" .config || return 0
+            if [ -f "$2" ]; then echo "OK  $2 ($(stat -c%s "$2") bytes)" >> "$R"; else echo "FALTA  $2 (CONFIG_$1=y pero no hay objeto)" >> "$R"; fi
+          }
+          chk TCP_CONG_CUBIC net/ipv4/tcp_cubic.o
+          chk TCP_CONG_BBR net/ipv4/tcp_bbr.o
+          chk TCP_CONG_BBR net/ipv4/tcp_rate.o
+          chk TCP_CONG_BBR lib/win_minmax.o
+          chk TCP_CONG_CDG net/ipv4/tcp_cdg.o
+          chk TCP_CONG_VEGAS net/ipv4/tcp_vegas.o
+          chk TCP_CONG_VENO net/ipv4/tcp_veno.o
+          chk TCP_CONG_ILLINOIS net/ipv4/tcp_illinois.o
+          chk TCP_CONG_YEAH net/ipv4/tcp_yeah.o
+          chk TCP_CONG_HYBLA net/ipv4/tcp_hybla.o
+          chk TCP_CONG_HSTCP net/ipv4/tcp_highspeed.o
+          chk TCP_CONG_SCALABLE net/ipv4/tcp_scalable.o
+          chk TCP_CONG_LP net/ipv4/tcp_lp.o
+          chk NET_SCH_FQ net/sched/sch_fq.o
+          chk NET_SCH_FQ_CODEL net/sched/sch_fq_codel.o
+          chk NET_SCH_CODEL net/sched/sch_codel.o
+          chk NET_SCH_PIE net/sched/sch_pie.o
+          chk NET_SCH_SFQ net/sched/sch_sfq.o
+          chk NET_SCH_NETEM net/sched/sch_netem.o
+          chk NET_SCH_TBF net/sched/sch_tbf.o
+          chk NETFILTER_XT_TARGET_HL net/netfilter/xt_HL.o
+          chk NET_PKTGEN net/core/pktgen.o
+          chk IOSCHED_BFQ block/bfq-iosched.o
+          chk CPU_FREQ_GOV_BLU_ACTIVE drivers/cpufreq/cpufreq_blu_active.o
+          chk CPU_FREQ_GOV_BIOSHOCK drivers/cpufreq/cpufreq_bioshock.o
+          chk CPU_FREQ_GOV_DARKNESS drivers/cpufreq/cpufreq_darkness.o
+          chk NET_DROP_MONITOR net/core/drop_monitor.o
+          chk USB_NET_RNDIS_HOST drivers/net/usb/rndis_host.o
+          chk USB_LAN78XX drivers/net/usb/lan78xx.o
+          chk USB_NET_DM9601 drivers/net/usb/dm9601.o
+          chk USB_NET_SR9700 drivers/net/usb/sr9700.o
+          chk USB_NET_MCS7830 drivers/net/usb/mcs7830.o
+          cat "$R"
+          if grep -q '^FALTA' "$R"; then echo "ERROR: hay opciones activas sin objeto compilado"; exit 1; fi
+          echo "=== simbolos BBR en vmlinux ==="
+          "$CROSS_COMPILE"nm vmlinux | grep -E ' (bbr_cong_control|tcp_rate_gen|tcp_rate_skb_sent|minmax_running_max|tcp_bbr_cong_ops|bbr_init)$' | tee ../report/bbr-symbols.txt
+          [ "$(wc -l < ../report/bbr-symbols.txt)" -ge 4 ] || { echo "ERROR: faltan simbolos BBR en vmlinux"; exit 1; }
+          if grep -q '^CONFIG_IOSCHED_BFQ=y' .config; then
+            NB=$("$CROSS_COMPILE"nm vmlinux | grep -cE ' [tTdD] bfq_' || true)
+            echo "simbolos bfq_* en vmlinux: $NB"
+            [ "$NB" -ge 10 ] || { echo "ERROR: BFQ no quedo enlazado en vmlinux"; exit 1; }
+            echo "OK  vmlinux con $NB simbolos bfq_*" >> ../report/b2-status.txt
+          fi
+          echo "Version embebida en la Image:"
+          strings -n 20 arch/arm64/boot/Image | grep -m1 'Linux version' || true
+
+      # ============================================================
+      # EMPAQUETADO (igual que la base stock verificada)
+      # ============================================================
+      - name: Clonar AnyKernel3 propio
+        uses: actions/checkout@v4
+        with:
+          repository: sacksso/AnyKernel3-a7y18lte
+          token: ${{ secrets.AK3_TOKEN || github.token }}
+          path: ak3
+
+      - name: Empaquetar con AnyKernel3
+        id: pack
+        run: |
+          set -e
+          B=kernel/arch/arm64/boot
+          VER=$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | awk '{print $3}' | paste -sd.)
+          SHA=$(git -C kernel rev-parse --short HEAD)
+
+          cat > ak3/anykernel.sh <<'EOF'
+          #!/sbin/sh
+          ## AnyKernel3 setup script - TreeUI etapa B2 (red) a7y18lte
+
+          properties() { '
+          kernel.string=TreeUI etapa C __VER__ (a7y18lte) - B2 + SELinux sin NEVER_ENFORCE
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=;
+          for p in /dev/block/by-name/BOOT \
+                   /dev/block/platform/13500000.dwmmc0/by-name/BOOT \
+                   /dev/block/bootdevice/by-name/BOOT; do
+            if [ -e "$p" ]; then BLOCK=$p; break; fi
+          done
+          is_slot_device=0;
+          ramdisk_compression=auto;
+
+          . tools/ak3-core.sh;
+
+          if [ -z "$BLOCK" ] || [ ! -e "$BLOCK" ]; then
+            abort "No se encontro la particion BOOT";
+          fi
+          ui_print "BOOT: $BLOCK";
+
+          dump_boot;
+          write_boot;
+          EOF
+          sed -i "s/__VER__/${VER}/" ak3/anykernel.sh
+          if [ "${{ inputs.cmdline_permissive }}" = "true" ]; then
+            sed -i 's|^write_boot;|patch_cmdline "androidboot.selinux" "androidboot.selinux=permissive";\nwrite_boot;|' ak3/anykernel.sh
+          fi
+
+          find ak3/ramdisk -mindepth 1 -delete 2>/dev/null || true
+          rm -f ak3/Image ak3/Image.gz* ak3/zImage* ak3/dtb ak3/dtb.img ak3/*.zip
+          cp "$B/Image" ak3/Image
+          if [ "${{ inputs.incluir_dtb }}" = "true" ]; then
+            cp "$B/dtb.img" ak3/dtb.img
+            cp "$B/dtb.img" ak3/dtb
+            DTB=withdtb
+          else
+            DTB=imageonly
+          fi
+
+          cat > ak3/build-info.txt <<EOF
+          TreeUI etapa B2 (BBR + BFQ + gobernadores + red)
+          Kernel: $VER (commit $SHA)  defconfig: ${{ steps.cfg.outputs.def }}
+          TCP default: ${{ inputs.bbr_default && 'bbr' || 'cubic' }} (BBR disponible)
+          Parche BBR: $(cat report/bbr_method.txt) sha256 $(cut -d' ' -f1 report/patch.sha256)
+          Opciones activas: ${NET_SUMMARY:-desconocido}
+          Wi-Fi PS: ${WIFI_PS:-sin cambios}
+          SELinux: modo=${{ inputs.selinux_modo }} cmdline_permissive=${{ inputs.cmdline_permissive }}
+          --- B2 ---
+          $(cat report/b2-status.txt 2>/dev/null)
+          --- estado por simbolo ---
+          $(cat report/net-status.txt)
+          --- objetos compilados ---
+          $(cat report/obj-status.txt)
+          EOF
+
+          ZIP="TreeUI-a7y18lte-etapaC-${{ inputs.selinux_modo }}-${VER}-${SHA}-${DTB}-$(date +%Y%m%d-%H%M).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.git/*' '.github/*' '*.md')
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          unzip -l "$ZIP"
+          unzip -p "$ZIP" anykernel.sh | grep -q 'do.devicecheck=0' || { echo "ERROR: devicecheck no es 0"; exit 1; }
+          unzip -p "$ZIP" anykernel.sh | grep -q 'by-name/BOOT' || { echo "ERROR: BLOCK incorrecto"; exit 1; }
+          if [ "${{ inputs.cmdline_permissive }}" = "true" ]; then
+            unzip -p "$ZIP" anykernel.sh | grep -q 'androidboot.selinux=permissive' || { echo "ERROR: falta patch_cmdline de SELinux"; exit 1; }
+          else
+            unzip -p "$ZIP" anykernel.sh | grep -q 'patch_cmdline' && { echo "ERROR: quedo patch_cmdline"; exit 1; } || true
+          fi
+          unzip -l "$ZIP" | grep -qE '[[:space:]]Image$' || { echo "ERROR: falta Image en el zip"; exit 1; }
+          echo "Zip OK"
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "## Etapa B1 - BBR + config de red"
+            echo "Opciones: ${NET_SUMMARY:-?}"
+            echo '```'
+            cat report/net-status.txt 2>/dev/null
+            echo '--- objetos ---'
+            cat report/obj-status.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir zip flasheable
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-etapaC-flashable
+          path: ${{ steps.pack.outputs.zip }}
+
+      - name: Subir informes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: treeui-etapaC-report
+          path: |
+            report/
+            kernel/.config
+            build.log
+            build_serial.log

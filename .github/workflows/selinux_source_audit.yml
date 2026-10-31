@@ -1,0 +1,66 @@
+name: selinux_source_audit
+
+# Solo lectura: clona el kernel (historial completo, sin blobs) y muestra COMO se fuerza
+# SELinux a Permissive: codigo actual + commits que lo tocaron.
+# Contexto: en el telefono `setenforce 1` es ignorado => el forzado esta en el kernel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repo del kernel"
+        default: "https://github.com/VDavid003/universal7885_treeui_kernel"
+      ref:
+        description: "Rama"
+        default: "treeui_treble"
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clonar kernel (historial completo, sin blobs)
+        run: |
+          KERNEL_URL="${{ inputs.repo }}"
+          FILTER="--filter=blob:none"
+          git clone $FILTER -b "${{ inputs.ref }}" "$KERNEL_URL" kernel
+
+      - name: Auditar como se fuerza Permissive
+        run: |
+          cd kernel
+          mkdir -p ../audit
+          {
+            echo "### defconfig a7y18lte (SELinux / AUDIT / DEFEX / AVC)"
+            grep -nE 'SELINUX|SECURITY_DEFEX|CONFIG_AUDIT|ALWAYS_ENFORCE|NEVER_ENFORCE|SEC_AVC|PROCA|FIVE' arch/arm64/configs/exynos7885-a7y18lte_defconfig || true
+            echo
+            echo "### enforcing en hooks.c / selinuxfs.c / security.h / services.c"
+            grep -nE 'selinux_enforcing|enforcing_enabled|selinux_enabled|ALWAYS_ENFORCE|NEVER_ENFORCE|androidboot' \
+              security/selinux/hooks.c security/selinux/selinuxfs.c security/selinux/include/security.h security/selinux/ss/services.c 2>/dev/null || true
+            echo
+            echo "### sel_write_enforce completo"
+            awk '/static ssize_t sel_write_enforce/,/^}/' security/selinux/selinuxfs.c || true
+            echo
+            echo "### selinux_enforcing / enforcing_* en TODO el arbol (max 60)"
+            grep -rnE 'selinux_enforcing|enforcing_enabled|enforcing_set' --include=*.c --include=*.h . | head -n 60 || true
+            echo
+            echo "### Samsung: sec_avc_log / avc_msg"
+            grep -rnE 'avc_msg|sec_avc_log' --include=*.c --include=*.h security drivers fs 2>/dev/null | head -n 20 || true
+            echo
+            echo "### Menciones a permissive forzado en security/ e init/"
+            grep -rniE 'force.*permissive|permissive.*force|selinux.*permissive' --include=*.c --include=*.h --include=Kconfig security init 2>/dev/null | head -n 30 || true
+            echo
+            echo "### Historial reciente de security/selinux (30)"
+            git log -n 30 --date=short --format='%h %ad %an | %s' -- security/selinux || true
+            echo
+            echo "### Commits cuyo mensaje menciona permissive o enforc (40)"
+            git log -n 40 --date=short --format='%h %ad %an | %s' -i --grep='permissive' --grep='enforc' || true
+            echo
+            echo "### Ultimos 3 cambios de selinuxfs.c y hooks.c (parche, max 220 lineas)"
+            git log -n 3 -p --date=short --format='=== %h %ad %an | %s' -- security/selinux/selinuxfs.c security/selinux/hooks.c | head -n 220 || true
+          } > ../audit/selinux_source.txt 2>&1
+          cat ../audit/selinux_source.txt
+
+      - name: Subir informe
+        uses: actions/upload-artifact@v4
+        with:
+          name: selinux-source-audit
+          path: audit/
